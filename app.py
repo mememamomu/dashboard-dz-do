@@ -571,7 +571,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
 
 
 # =============================================================================
-st.title("📊 Финансовый дашборд ДЗ / ДО")
+st.title("📊 Дашборд по ДЗ")
 
 with st.sidebar:
     st.header("Режим")
