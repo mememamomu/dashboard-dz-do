@@ -1,21 +1,152 @@
 import io
+import json
 import re
 import zipfile
+from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Финансовый дашборд ДЗ / ДО", page_icon="📊", layout="wide")
 
-st.title("📊 Финансовый дашборд ДЗ / ДО")
-st.caption(
-    "Все финансовые показатели считаются по данным из файла «дз» "
-    "(сумма выставленных — из столбца «Сумма по счету»). "
-    "Файл «до» используется только для расчёта «Не выставлено»."
-)
+# =============================================================================
+# Настройки публикации (GitHub)
+# В Streamlit Cloud: Settings → Secrets
+# Локально: файл .streamlit/secrets.toml
+# =============================================================================
+# Пример secrets.toml:
+#
+# admin_password = "ваш_секретный_пароль"
+#
+# [github]
+# token = "ghp_xxxxxxxx"          # Personal Access Token с правом repo
+# repo = "логин/dashboard-dz-do"  # владелец/репозиторий
+# path = "data/published.json"    # путь к файлу снимка в репозитории
+# branch = "main"
+# =============================================================================
+
+def get_secret(key, default=None):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
 
 
+def get_github_cfg():
+    try:
+        gh = st.secrets.get("github", {})
+        return {
+            "token": gh.get("token", ""),
+            "repo": gh.get("repo", ""),
+            "path": gh.get("path", "data/published.json"),
+            "branch": gh.get("branch", "main"),
+        }
+    except Exception:
+        return {"token": "", "repo": "", "path": "data/published.json", "branch": "main"}
+
+
+ADMIN_PASSWORD = get_secret("admin_password", "")
+GITHUB = get_github_cfg()
+PUBLISH_ENABLED = bool(GITHUB["token"] and GITHUB["repo"])
+
+
+# -----------------------------------------------------------------------------
+# Работа со снимком (publish / load)
+# -----------------------------------------------------------------------------
+def load_published_snapshot():
+    """Загружает последний опубликованный снимок из GitHub."""
+    if not PUBLISH_ENABLED:
+        return None
+    url = (
+        f"https://api.github.com/repos/{GITHUB['repo']}/contents/{GITHUB['path']}"
+        f"?ref={GITHUB['branch']}"
+    )
+    headers = {
+        "Authorization": f"Bearer {GITHUB['token']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        content_b64 = r.json()["content"]
+        import base64
+        raw = base64.b64decode(content_b64).decode("utf-8")
+        return json.loads(raw)
+    except Exception as e:
+        st.warning(f"Не удалось загрузить опубликованные данные: {e}")
+        return None
+
+
+def publish_snapshot(snapshot: dict) -> tuple[bool, str]:
+    """Сохраняет снимок в GitHub (create or update)."""
+    if not PUBLISH_ENABLED:
+        return False, "Публикация не настроена (нет token/repo в secrets)."
+
+    import base64
+
+    url = f"https://api.github.com/repos/{GITHUB['repo']}/contents/{GITHUB['path']}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB['token']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    # Получаем sha текущего файла (если есть) — нужен для update
+    sha = None
+    try:
+        r = requests.get(url + f"?ref={GITHUB['branch']}", headers=headers, timeout=30)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+    except Exception:
+        pass
+
+    payload = {
+        "message": f"Публикация снимка ДЗ/ДО {snapshot.get('published_at', '')}",
+        "content": base64.b64encode(
+            json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
+        ).decode("ascii"),
+        "branch": GITHUB["branch"],
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        r = requests.put(url, headers=headers, json=payload, timeout=60)
+        if r.status_code in (200, 201):
+            return True, "Снимок успешно опубликован."
+        return False, f"Ошибка GitHub API ({r.status_code}): {r.text[:300]}"
+    except Exception as e:
+        return False, str(e)
+
+
+def snapshot_from_data(summary_f: pd.DataFrame, metrics: dict) -> dict:
+    """Упаковывает сводку и KPI в JSON-снимок."""
+    records = summary_f.copy()
+    for col in records.columns:
+        if records[col].dtype == "float64":
+            records[col] = records[col].round(2)
+    return {
+        "published_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "metrics": {k: round(float(v), 2) for k, v in metrics.items()},
+        "summary": records.to_dict(orient="records"),
+        "rows_count": len(records),
+    }
+
+
+def summary_from_snapshot(snap: dict) -> tuple[pd.DataFrame, dict]:
+    metrics = snap.get("metrics", {})
+    summary = pd.DataFrame(snap.get("summary", []))
+    return summary, metrics
+
+
+# -----------------------------------------------------------------------------
+# Утилиты Excel
+# -----------------------------------------------------------------------------
 def normalize_xlsx(file_bytes: bytes) -> io.BytesIO:
     src = io.BytesIO(file_bytes)
     dst = io.BytesIO()
@@ -67,11 +198,16 @@ def number(series):
 
 
 def rub(value):
-    return f"{value:,.2f} ₽".replace(",", " ").replace(".", ",")
+    try:
+        return f"{float(value):,.2f} ₽".replace(",", " ").replace(".", ",")
+    except Exception:
+        return "—"
 
 
+# -----------------------------------------------------------------------------
+# Расчёт ДЗ / ДО
+# -----------------------------------------------------------------------------
 def build_dz(raw):
-    """Все финансовые показатели — только из ДЗ. Сумма выставленных = «Сумма по счету»."""
     c_payer = find_col(raw, "Плательщик")
     c_client = find_col(raw, "Заявка.Контрагент", "Контрагент")
     c_request = find_col(raw, "Заявка.Номер", "Номер заявки")
@@ -84,9 +220,7 @@ def build_dz(raw):
     c_sent = find_col(raw, "Дата отправления")
 
     if c_client is None or c_invoice is None:
-        raise ValueError(
-            "В файле ДЗ не найдены обязательные столбцы «Заявка.Контрагент» и/или «Счет на оплату»."
-        )
+        raise ValueError("В файле ДЗ не найдены «Заявка.Контрагент» и/или «Счет на оплату».")
     if c_invoice_sum is None:
         raise ValueError("В файле ДЗ не найден столбец «Сумма по счету».")
 
@@ -117,19 +251,15 @@ def build_dz(raw):
     ].copy()
 
     df["Остаток"] = (df["Сумма счета"] - df["Оплачено"]).clip(lower=0)
-
     no_sent = df["Дата отправления"].isna()
     is_late = df["Просрочка, дни"] > 0
-
     df["Не отправлено"] = df["Остаток"].where(no_sent, 0)
     df["Просрочено"] = df["Остаток"].where(~no_sent & is_late, 0)
     df["Подходит к оплате"] = df["Остаток"].where(~no_sent & ~is_late, 0)
-
     return df
 
 
 def build_unissued(raw_do):
-    """Не выставлено — только из ДО: заявки без номера счёта."""
     c_client = find_col(raw_do, "Клиент")
     c_request = find_col(raw_do, "Заявка")
     c_invoice = find_col(raw_do, "Номер счета", "Номер счёта")
@@ -139,11 +269,10 @@ def build_unissued(raw_do):
     c_manager = find_col(raw_do, "Клиентский бухгалтер", "Менеджер")
 
     if c_client is None or c_amount is None:
-        raise ValueError("В файле ДО не найдены обязательные столбцы «Клиент» и/или «Ставка заказчика».")
+        raise ValueError("В файле ДО не найдены «Клиент» и/или «Ставка заказчика».")
 
     amount = number(raw_do[c_amount])
     invoice = raw_do[c_invoice].astype(str).str.strip() if c_invoice else pd.Series([""] * len(raw_do))
-
     no_invoice = (
         invoice.isna()
         | (invoice == "")
@@ -160,14 +289,12 @@ def build_unissued(raw_do):
         "Дата заявки": to_date(raw_do[c_date]) if c_date else pd.NaT,
         "Бухгалтер": raw_do[c_manager].astype(str).str.strip() if c_manager else "",
     })
-
     df = df[
         no_invoice
         & (df["Контрагент"] != "")
         & (df["Контрагент"].str.lower() != "nan")
         & (df["Сумма"] != 0)
     ].copy()
-
     return df
 
 
@@ -182,317 +309,260 @@ def build_summary(dz: pd.DataFrame, unissued: pd.DataFrame) -> pd.DataFrame:
             **{"Не отправлено": ("Не отправлено", "sum")},
         )
     )
-
     not_issued = (
         unissued.groupby("Контрагент", as_index=False)
         .agg(**{"Не выставлено": ("Сумма", "sum")})
     )
-
     summary = issued.merge(not_issued, on="Контрагент", how="outer").fillna(0)
     summary["Оборот"] = summary["Выставлено"] + summary["Не выставлено"]
     summary = summary[
         [
-            "Контрагент",
-            "Оборот",
-            "Выставлено",
-            "Оплачено",
-            "Просрочено",
-            "Подходит к оплате",
-            "Не отправлено",
-            "Не выставлено",
+            "Контрагент", "Оборот", "Выставлено", "Оплачено",
+            "Просрочено", "Подходит к оплате", "Не отправлено", "Не выставлено",
         ]
     ]
-    summary = summary.sort_values("Оборот", ascending=False).reset_index(drop=True)
-    return summary
+    return summary.sort_values("Оборот", ascending=False).reset_index(drop=True)
 
 
-with st.sidebar:
-    st.header("1. Загрузка данных")
-    dz_file = st.file_uploader("Файл ДЗ (.xlsx)", type=["xlsx"], key="dz")
-    do_file = st.file_uploader("Файл ДО (.xlsx)", type=["xlsx"], key="do")
-    st.caption("Загрузите актуальные выгрузки «дз.xlsx» и «до.xlsx».")
+def render_dashboard(summary_f: pd.DataFrame, metrics: dict, source_label: str):
+    """Общая отрисовка KPI + вкладок для опубликованных и свежих данных."""
+    st.caption(source_label)
 
-if not dz_file or not do_file:
-    st.info("Загрузите оба исходных файла — «дз.xlsx» и «до.xlsx», чтобы построить отчёт.")
-    st.markdown(
-        """
-        **Логика расчёта (как в «Отчет по ДЗ НОВЫЙ»):**
-        - **Выставлено / Оплачено / Просрочено / Подходит к оплате / Не отправлено** — только из файла ДЗ.
-          Сумма счетов берётся из столбца **«Сумма по счету»**.
-        - **Не выставлено** — из файла ДО (заявки без номера счёта, сумма = «Ставка заказчика»).
-        - **Оборот** = Выставлено + Не выставлено.
-        - Остаток выставленных счетов делится на три категории:
-          1. **Не отправлено** — нет даты отправления;
-          2. **Просрочено** — есть дата отправления и дни просрочки > 0;
-          3. **Подходит к оплате** — есть дата отправления и дни просрочки ≤ 0.
-        """
-    )
-    st.stop()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Оборот", rub(metrics.get("Оборот", 0)))
+    c2.metric("Выставлено (Сумма по счету)", rub(metrics.get("Выставлено", 0)))
+    c3.metric("Оплачено", rub(metrics.get("Оплачено", 0)))
+    c4.metric("Не выставлено (из ДО)", rub(metrics.get("Не выставлено", 0)))
 
-try:
-    dz_raw = read_source(dz_file, header_row=4)
-    do_raw = read_source(do_file, header_row=4)
-    dz = build_dz(dz_raw)
-    unissued = build_unissued(do_raw)
-    summary = build_summary(dz, unissued)
-except Exception as exc:
-    st.error(f"Не удалось обработать файлы: {exc}")
-    st.stop()
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Просрочено", rub(metrics.get("Просрочено", 0)))
+    c6.metric("Подходит к оплате", rub(metrics.get("Подходит к оплате", 0)))
+    c7.metric("Не отправлено", rub(metrics.get("Не отправлено", 0)))
 
-st.sidebar.divider()
-st.sidebar.header("2. Фильтры")
+    tab1, tab2, tab3 = st.tabs(["📋 Сводка по контрагентам", "📈 Аналитика", "⬇️ Выгрузка"])
 
-clients = sorted(summary["Контрагент"].dropna().unique().tolist())
-selected_clients = st.sidebar.multiselect("Контрагент", clients, default=[])
+    with tab1:
+        st.subheader("Сводка в формате «ОБЩАЯ ДЗ»")
+        if summary_f is not None and not summary_f.empty:
+            fmt = {
+                c: "{:,.2f}" for c in summary_f.columns if c != "Контрагент"
+            }
+            st.dataframe(
+                summary_f.style.format(fmt),
+                use_container_width=True,
+                hide_index=True,
+                height=520,
+            )
+        else:
+            st.info("Нет данных для отображения.")
 
-payers = sorted(
-    [x for x in dz["Плательщик"].dropna().unique().tolist() if x and str(x).lower() not in ("nan", "none")]
-)
-selected_payers = st.sidebar.multiselect("Плательщик (ДЗ)", payers, default=[])
-
-valid_inv = dz["Дата счета"].dropna()
-if not valid_inv.empty:
-    min_d, max_d = valid_inv.min().date(), valid_inv.max().date()
-    invoice_range = st.sidebar.date_input(
-        "Дата счёта (ДЗ)",
-        value=(min_d, max_d),
-        min_value=min_d,
-        max_value=max_d,
-        key="invoice_date",
-    )
-else:
-    invoice_range = None
-    st.sidebar.caption("Дата счёта: в данных нет дат")
-
-valid_due = dz["Дата оплаты по договору"].dropna()
-if not valid_due.empty:
-    min_d, max_d = valid_due.min().date(), valid_due.max().date()
-    due_range = st.sidebar.date_input(
-        "Дата оплаты по договору (ДЗ)",
-        value=(min_d, max_d),
-        min_value=min_d,
-        max_value=max_d,
-        key="due_date",
-    )
-else:
-    due_range = None
-    st.sidebar.caption("Дата оплаты по договору: в данных нет дат")
-
-dz_f = dz.copy()
-unissued_f = unissued.copy()
-
-if selected_clients:
-    dz_f = dz_f[dz_f["Контрагент"].isin(selected_clients)]
-    unissued_f = unissued_f[unissued_f["Контрагент"].isin(selected_clients)]
-
-if selected_payers:
-    dz_f = dz_f[dz_f["Плательщик"].isin(selected_payers)]
-
-
-def apply_date_range(frame, column, date_range):
-    if date_range and len(date_range) == 2 and column in frame.columns:
-        start = pd.Timestamp(date_range[0])
-        end = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-        return frame[frame[column].between(start, end)]
-    return frame
-
-
-dz_f = apply_date_range(dz_f, "Дата счета", invoice_range)
-dz_f = apply_date_range(dz_f, "Дата оплаты по договору", due_range)
-
-summary_f = build_summary(dz_f, unissued_f)
-
-total_oborot = summary_f["Оборот"].sum()
-total_issued = summary_f["Выставлено"].sum()
-total_paid = summary_f["Оплачено"].sum()
-total_overdue = summary_f["Просрочено"].sum()
-total_approaching = summary_f["Подходит к оплате"].sum()
-total_not_sent = summary_f["Не отправлено"].sum()
-total_not_issued = summary_f["Не выставлено"].sum()
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Оборот", rub(total_oborot))
-c2.metric("Выставлено (Сумма по счету)", rub(total_issued))
-c3.metric("Оплачено", rub(total_paid))
-c4.metric("Не выставлено (из ДО)", rub(total_not_issued))
-
-c5, c6, c7 = st.columns(3)
-c5.metric("Просрочено", rub(total_overdue))
-c6.metric("Подходит к оплате", rub(total_approaching))
-c7.metric("Не отправлено", rub(total_not_sent))
-
-st.caption(
-    f"Строк ДЗ после фильтрации: {len(dz_f):,} · "
-    f"Невыставленных заявок (ДО): {len(unissued_f):,}".replace(",", " ")
-)
-
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📋 Сводка по контрагентам", "📈 Аналитика", "🔎 Детализация ДЗ", "⬇️ Выгрузка"]
-)
-
-with tab1:
-    st.subheader("Сводка в формате «ОБЩАЯ ДЗ»")
-    st.dataframe(
-        summary_f.style.format({
-            "Оборот": "{:,.2f}",
-            "Выставлено": "{:,.2f}",
-            "Оплачено": "{:,.2f}",
-            "Просрочено": "{:,.2f}",
-            "Подходит к оплате": "{:,.2f}",
-            "Не отправлено": "{:,.2f}",
-            "Не выставлено": "{:,.2f}",
-        }),
-        use_container_width=True,
-        hide_index=True,
-        height=520,
-    )
-
-with tab2:
-    left, right = st.columns(2)
-    with left:
-        status = pd.DataFrame({
-            "Категория": ["Оплачено", "Просрочено", "Подходит к оплате", "Не отправлено", "Не выставлено"],
-            "Сумма": [total_paid, total_overdue, total_approaching, total_not_sent, total_not_issued],
-        })
-        status = status[status["Сумма"] > 0]
-        if not status.empty:
-            fig = px.pie(
-                status,
-                names="Категория",
-                values="Сумма",
-                hole=0.5,
-                title="Структура: оплачено и остатки",
+    with tab2:
+        left, right = st.columns(2)
+        with left:
+            status = pd.DataFrame({
+                "Категория": [
+                    "Оплачено", "Просрочено", "Подходит к оплате",
+                    "Не отправлено", "Не выставлено",
+                ],
+                "Сумма": [
+                    metrics.get("Оплачено", 0),
+                    metrics.get("Просрочено", 0),
+                    metrics.get("Подходит к оплате", 0),
+                    metrics.get("Не отправлено", 0),
+                    metrics.get("Не выставлено", 0),
+                ],
+            })
+            status = status[status["Сумма"] > 0]
+            if not status.empty:
+                fig = px.pie(
+                    status, names="Категория", values="Сумма",
+                    hole=0.5, title="Структура: оплачено и остатки",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        with right:
+            bar_df = pd.DataFrame({
+                "Показатель": [
+                    "Выставлено", "Оплачено", "Просрочено",
+                    "Подходит к оплате", "Не отправлено", "Не выставлено",
+                ],
+                "Сумма": [
+                    metrics.get("Выставлено", 0),
+                    metrics.get("Оплачено", 0),
+                    metrics.get("Просрочено", 0),
+                    metrics.get("Подходит к оплате", 0),
+                    metrics.get("Не отправлено", 0),
+                    metrics.get("Не выставлено", 0),
+                ],
+            })
+            fig = px.bar(
+                bar_df, x="Показатель", y="Сумма",
+                title="Ключевые показатели", labels={"Сумма": "Сумма, ₽"},
             )
             st.plotly_chart(fig, use_container_width=True)
 
-    with right:
-        bar_df = pd.DataFrame({
-            "Показатель": [
-                "Выставлено", "Оплачено", "Просрочено",
-                "Подходит к оплате", "Не отправлено", "Не выставлено",
-            ],
-            "Сумма": [
-                total_issued, total_paid, total_overdue,
-                total_approaching, total_not_sent, total_not_issued,
-            ],
-        })
-        fig = px.bar(
-            bar_df, x="Показатель", y="Сумма",
-            title="Ключевые показатели", labels={"Сумма": "Сумма, ₽"},
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        if summary_f is not None and not summary_f.empty:
+            top = summary_f.nlargest(15, "Оборот")
+            fig = px.bar(
+                top.sort_values("Оборот"),
+                x="Оборот", y="Контрагент", orientation="h",
+                title="Топ-15 контрагентов по обороту",
+                labels={"Оборот": "Оборот, ₽"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    monthly = dz_f.dropna(subset=["Дата счета"]).copy()
-    if not monthly.empty:
-        monthly["Месяц"] = monthly["Дата счета"].dt.to_period("M").dt.to_timestamp()
-        monthly = monthly.groupby("Месяц", as_index=False).agg(
-            Выставлено=("Сумма счета", "sum"),
-            Оплачено=("Оплачено", "sum"),
-            Просрочено=("Просрочено", "sum"),
-        )
-        fig = px.line(
-            monthly,
-            x="Месяц",
-            y=["Выставлено", "Оплачено", "Просрочено"],
-            markers=True,
-            title="Динамика выставленных / оплаченных / просроченных (по дате счёта, ДЗ)",
-            labels={"value": "Сумма, ₽", "variable": "Показатель"},
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    with tab3:
+        if summary_f is not None and not summary_f.empty:
+            csv = summary_f.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                "Скачать сводку (CSV)",
+                data=csv,
+                file_name="сводка_ДЗ.csv",
+                mime="text/csv",
+            )
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                summary_f.to_excel(writer, index=False, sheet_name="ОБЩАЯ ДЗ")
+            st.download_button(
+                "Скачать сводку (Excel)",
+                data=buf.getvalue(),
+                file_name="Отчет_ОБЩАЯ_ДЗ.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.info("Нет данных для выгрузки.")
 
-    top = summary_f.nlargest(15, "Оборот")
-    if not top.empty:
-        fig = px.bar(
-            top.sort_values("Оборот"),
-            x="Оборот",
-            y="Контрагент",
-            orientation="h",
-            title="Топ-15 контрагентов по обороту",
-            labels={"Оборот": "Оборот, ₽"},
-        )
-        st.plotly_chart(fig, use_container_width=True)
 
-with tab3:
-    st.subheader("Детализация по счетам (только ДЗ)")
-    search = st.text_input("Поиск по контрагенту, счёту или заявке")
-    view = dz_f.copy()
-    if search:
-        mask = (
-            view["Контрагент"].astype(str).str.contains(search, case=False, na=False)
-            | view["Номер счета"].astype(str).str.contains(search, case=False, na=False)
-            | view["Заявка"].astype(str).str.contains(search, case=False, na=False)
-        )
-        view = view[mask]
+# =============================================================================
+# UI
+# =============================================================================
+st.title("📊 Финансовый дашборд ДЗ / ДО")
 
-    cols = [
-        "Контрагент", "Плательщик", "Заявка", "Номер счета", "Дата счета",
-        "Дата оплаты по договору", "Просрочка, дни", "Сумма счета", "Оплачено",
-        "Остаток", "Просрочено", "Подходит к оплате", "Не отправлено", "Дата отправления",
-    ]
-    st.dataframe(
-        view[cols].sort_values(["Дата счета", "Контрагент"], ascending=[False, True]),
-        use_container_width=True,
-        hide_index=True,
-        height=480,
+# --- Режим администратора (загрузка и публикация) ---
+with st.sidebar:
+    st.header("Режим")
+    is_admin = False
+    if ADMIN_PASSWORD:
+        pwd = st.text_input("Пароль администратора", type="password", key="admin_pwd")
+        is_admin = pwd == ADMIN_PASSWORD
+        if pwd and not is_admin:
+            st.error("Неверный пароль")
+    else:
+        st.caption("Пароль не задан в secrets — режим загрузки открыт локально.")
+        is_admin = st.checkbox("Режим загрузки и публикации", value=False)
+
+    if is_admin:
+        st.success("Режим администратора")
+        st.divider()
+        st.header("Загрузка данных")
+        dz_file = st.file_uploader("Файл ДЗ (.xlsx)", type=["xlsx"], key="dz")
+        do_file = st.file_uploader("Файл ДО (.xlsx)", type=["xlsx"], key="do")
+        st.caption("После расчёта нажмите «Опубликовать» — начальник увидит эти цифры по ссылке.")
+    else:
+        dz_file = None
+        do_file = None
+
+# --- Публичный просмотр: всегда пробуем загрузить снимок ---
+published = load_published_snapshot()
+
+# --- Админ загрузил файлы → считаем «живой» отчёт ---
+live_summary = None
+live_metrics = None
+live_dz = None
+live_unissued = None
+
+if is_admin and dz_file and do_file:
+    try:
+        dz_raw = read_source(dz_file, header_row=4)
+        do_raw = read_source(do_file, header_row=4)
+        live_dz = build_dz(dz_raw)
+        live_unissued = build_unissued(do_raw)
+        live_summary = build_summary(live_dz, live_unissued)
+        live_metrics = {
+            "Оборот": float(live_summary["Оборот"].sum()),
+            "Выставлено": float(live_summary["Выставлено"].sum()),
+            "Оплачено": float(live_summary["Оплачено"].sum()),
+            "Просрочено": float(live_summary["Просрочено"].sum()),
+            "Подходит к оплате": float(live_summary["Подходит к оплате"].sum()),
+            "Не отправлено": float(live_summary["Не отправлено"].sum()),
+            "Не выставлено": float(live_summary["Не выставлено"].sum()),
+        }
+    except Exception as exc:
+        st.error(f"Не удалось обработать файлы: {exc}")
+
+# --- Кнопка публикации (только админ + есть расчёт) ---
+if is_admin and live_summary is not None:
+    st.sidebar.divider()
+    if not PUBLISH_ENABLED:
+        st.sidebar.warning(
+            "Публикация не настроена. Добавьте в secrets:\n"
+            "admin_password, github.token, github.repo"
+        )
+    else:
+        if st.sidebar.button("📢 Опубликовать для руководства", type="primary"):
+            snap = snapshot_from_data(live_summary, live_metrics)
+            ok, msg = publish_snapshot(snap)
+            if ok:
+                st.sidebar.success(msg)
+                st.balloons()
+                # обновляем кэш снимка
+                published = snap
+            else:
+                st.sidebar.error(msg)
+
+# --- Что показывать ---
+if live_summary is not None:
+    # Админ видит свежий расчёт
+    render_dashboard(
+        live_summary,
+        live_metrics,
+        source_label=(
+            f"Черновик (ещё не опубликован) · строк ДЗ: {len(live_dz):,} · "
+            f"невыставленных: {len(live_unissued):,}".replace(",", " ")
+        ),
     )
+    # Детализация только в режиме админа
+    with st.expander("🔎 Детализация счетов (ДЗ) и невыставленные (ДО)"):
+        st.subheader("Счета (ДЗ)")
+        st.dataframe(live_dz, use_container_width=True, hide_index=True, height=300)
+        st.subheader("Не выставлено (ДО)")
+        st.dataframe(live_unissued, use_container_width=True, hide_index=True, height=300)
 
-    st.subheader("Невыставленные заявки (из ДО)")
-    search2 = st.text_input("Поиск по контрагенту / заявке (невыставленные)", key="search_unissued")
-    view_u = unissued_f.copy()
-    if search2:
-        mask = (
-            view_u["Контрагент"].astype(str).str.contains(search2, case=False, na=False)
-            | view_u["Заявка"].astype(str).str.contains(search2, case=False, na=False)
+elif published is not None:
+    summary_f, metrics = summary_from_snapshot(published)
+    when = published.get("published_at", "—")
+    render_dashboard(
+        summary_f,
+        metrics,
+        source_label=f"Опубликованные данные · {when}",
+    )
+else:
+    st.info(
+        "Пока нет опубликованных данных.\n\n"
+        "Администратор: введите пароль в боковой панели, загрузите «дз.xlsx» и «до.xlsx», "
+        "затем нажмите **«Опубликовать для руководства»**."
+    )
+    if not PUBLISH_ENABLED and not is_admin:
+        st.caption(
+            "Для постоянной ссылки настройте Streamlit secrets "
+            "(admin_password + github.token + github.repo) и задеплойте приложение."
         )
-        view_u = view_u[mask]
-    st.dataframe(
-        view_u.sort_values("Сумма", ascending=False),
-        use_container_width=True,
-        hide_index=True,
-        height=360,
-    )
-
-with tab4:
-    st.subheader("Выгрузка")
-    csv_summary = summary_f.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        "Скачать сводку по контрагентам (CSV)",
-        data=csv_summary,
-        file_name="сводка_ДЗ.csv",
-        mime="text/csv",
-    )
-
-    excel_buffer = io.BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        summary_f.to_excel(writer, index=False, sheet_name="ОБЩАЯ ДЗ")
-        dz_f.to_excel(writer, index=False, sheet_name="Детализация ДЗ")
-        unissued_f.to_excel(writer, index=False, sheet_name="Не выставлено (ДО)")
-    st.download_button(
-        "Скачать Excel (сводка + детализация + невыставленные)",
-        data=excel_buffer.getvalue(),
-        file_name="Отчет_ДЗ_ДО.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 
 with st.expander("Пояснения к расчётам"):
     st.markdown(
         """
 **Источник сумм**
-- **Выставлено** = сумма столбца **«Сумма по счету»** из файла ДЗ (не «Сумма по заявке»).
-- **Оплачено** = сумма столбца «Сумма оплаченная» из файла ДЗ.
-- **Остаток** = max(0, Выставлено − Оплачено) по каждой строке.
+- **Выставлено** = «Сумма по счету» из файла ДЗ
+- **Оплачено** = «Сумма оплаченная» из файла ДЗ
+- **Не выставлено** = «Ставка заказчика» из ДО по заявкам без номера счёта
+- **Оборот** = Выставлено + Не выставлено
 
-**Разбиение остатка (взаимоисключающие категории)**
-1. **Не отправлено** — остаток по строкам, где **Дата отправления** пустая.
-2. **Просрочено** — остаток по строкам, где дата отправления заполнена **и** «Количество дней просрочки счета» > 0.
-3. **Подходит к оплате** — остаток по строкам, где дата отправления заполнена **и** дни просрочки ≤ 0.
+**Остаток** (Выставлено − Оплачено) делится так:
+1. **Не отправлено** — нет даты отправления
+2. **Просрочено** — дата есть и дни просрочки > 0
+3. **Подходит к оплате** — дата есть и дни просрочки ≤ 0
 
-**Не выставлено**
-- Берётся **только** из файла ДО: заявки, у которых **Номер счета** пустой.
-- Сумма = «Ставка заказчика».
-
-**Оборот** = Выставлено + Не выставлено.
-
-Фильтры по дате счёта и дате оплаты по договору применяются только к данным ДЗ.
+**Как видит руководство**  
+Администратор загружает файлы и нажимает «Опубликовать».  
+Снимок сохраняется в GitHub. По той же ссылке руководство сразу видит последние опубликованные цифры — без загрузки файлов.
         """
     )
