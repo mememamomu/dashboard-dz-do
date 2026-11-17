@@ -1,4 +1,5 @@
 import base64
+import gzip
 import io
 import json
 import re
@@ -10,7 +11,7 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Дашборд по ДЗ", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Финансовый дашборд ДЗ / ДО", page_icon="📊", layout="wide")
 
 # =============================================================================
 # Secrets (Streamlit Cloud → Settings → Secrets)
@@ -20,7 +21,7 @@ st.set_page_config(page_title="Дашборд по ДЗ", page_icon="📊", layo
 # [github]
 # token = "ghp_..."
 # repo = "логин/dashbord-dz-do"
-# path = "data/published.json"
+# path = "data/published.json.gz"
 # branch = "main"
 # =============================================================================
 
@@ -38,11 +39,12 @@ def get_github_cfg():
         return {
             "token": gh.get("token", ""),
             "repo": gh.get("repo", ""),
-            "path": gh.get("path", "data/published.json"),
+            # .json.gz — сжатый снимок с полными данными
+            "path": gh.get("path", "data/published.json.gz"),
             "branch": gh.get("branch", "main"),
         }
     except Exception:
-        return {"token": "", "repo": "", "path": "data/published.json", "branch": "main"}
+        return {"token": "", "repo": "", "path": "data/published.json.gz", "branch": "main"}
 
 
 ADMIN_PASSWORD = get_secret("admin_password", "")
@@ -50,28 +52,82 @@ GITHUB = get_github_cfg()
 PUBLISH_ENABLED = bool(GITHUB["token"] and GITHUB["repo"])
 
 
-# -----------------------------------------------------------------------------
-# Публикация
-# -----------------------------------------------------------------------------
-def load_published_snapshot():
-    if not PUBLISH_ENABLED:
-        return None
-    url = (
-        f"https://api.github.com/repos/{GITHUB['repo']}/contents/{GITHUB['path']}"
-        f"?ref={GITHUB['branch']}"
-    )
-    headers = {
+def _gh_headers():
+    return {
         "Authorization": f"Bearer {GITHUB['token']}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+# -----------------------------------------------------------------------------
+# Публикация / загрузка ПОЛНОГО снимка
+# -----------------------------------------------------------------------------
+def load_published_snapshot():
+    """Загружает полный снимок (gzip JSON) из GitHub."""
+    if not PUBLISH_ENABLED:
+        return None
+
+    api_url = (
+        f"https://api.github.com/repos/{GITHUB['repo']}/contents/{GITHUB['path']}"
+        f"?ref={GITHUB['branch']}"
+    )
     try:
-        r = requests.get(url, headers=headers, timeout=30)
+        r = requests.get(api_url, headers=_gh_headers(), timeout=60)
         if r.status_code == 404:
             return None
-        r.raise_for_status()
-        raw = base64.b64decode(r.json()["content"]).decode("utf-8")
-        return json.loads(raw)
+        if r.status_code != 200:
+            st.warning(f"GitHub API {r.status_code}: {r.text[:400]}")
+            return None
+
+        meta = r.json()
+        raw_bytes = None
+
+        # 1) content (файлы < ~1 МБ)
+        if meta.get("content"):
+            raw_bytes = base64.b64decode(meta["content"])
+        # 2) download_url (файлы побольше, private repo — с токеном)
+        elif meta.get("download_url"):
+            r2 = requests.get(
+                meta["download_url"],
+                headers={"Authorization": f"Bearer {GITHUB['token']}"},
+                timeout=180,
+            )
+            if r2.status_code != 200:
+                st.warning(f"download_url HTTP {r2.status_code}: {r2.text[:300]}")
+                return None
+            raw_bytes = r2.content
+        # 3) git blob API
+        elif meta.get("sha"):
+            blob_url = f"https://api.github.com/repos/{GITHUB['repo']}/git/blobs/{meta['sha']}"
+            r3 = requests.get(blob_url, headers=_gh_headers(), timeout=180)
+            if r3.status_code == 200:
+                blob = r3.json()
+                if blob.get("content"):
+                    raw_bytes = base64.b64decode(blob["content"])
+            if raw_bytes is None:
+                st.warning("Не удалось получить содержимое blob.")
+                return None
+        else:
+            st.warning("GitHub не вернул content / download_url / sha.")
+            return None
+
+        if not raw_bytes:
+            st.warning("Опубликованный файл пустой. Опубликуйте данные заново.")
+            return None
+
+        # Распаковка gzip (если это gzip)
+        try:
+            text = gzip.decompress(raw_bytes).decode("utf-8")
+        except OSError:
+            text = raw_bytes.decode("utf-8")
+
+        text = text.strip()
+        if not text:
+            st.warning("После распаковки снимок пустой. Опубликуйте заново.")
+            return None
+
+        return json.loads(text)
     except Exception as e:
         st.warning(f"Не удалось загрузить опубликованные данные: {e}")
         return None
@@ -80,39 +136,45 @@ def load_published_snapshot():
 def publish_snapshot(snapshot: dict) -> tuple[bool, str]:
     if not PUBLISH_ENABLED:
         return False, "Публикация не настроена (нет token/repo в secrets)."
+
     url = f"https://api.github.com/repos/{GITHUB['repo']}/contents/{GITHUB['path']}"
-    headers = {
-        "Authorization": f"Bearer {GITHUB['token']}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
     sha = None
     try:
-        r = requests.get(url + f"?ref={GITHUB['branch']}", headers=headers, timeout=30)
+        r = requests.get(url + f"?ref={GITHUB['branch']}", headers=_gh_headers(), timeout=30)
         if r.status_code == 200:
             sha = r.json().get("sha")
     except Exception:
         pass
+
+    raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=9)
+
+    # Лимит Contents API ~100 МБ; на практике лучше не раздувать
+    if len(compressed) > 90 * 1024 * 1024:
+        return False, f"Снимок слишком большой ({len(compressed)/1024/1024:.1f} МБ). Сократите период в исходных файлах."
+
     payload = {
-        "message": f"Публикация снимка ДЗ/ДО {snapshot.get('published_at', '')}",
-        "content": base64.b64encode(
-            json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
-        ).decode("ascii"),
+        "message": f"Публикация полного снимка ДЗ/ДО {snapshot.get('published_at', '')}",
+        "content": base64.b64encode(compressed).decode("ascii"),
         "branch": GITHUB["branch"],
     }
     if sha:
         payload["sha"] = sha
+
     try:
-        r = requests.put(url, headers=headers, json=payload, timeout=90)
+        r = requests.put(url, headers=_gh_headers(), json=payload, timeout=180)
         if r.status_code in (200, 201):
-            return True, "Снимок успешно опубликован."
-        return False, f"Ошибка GitHub API ({r.status_code}): {r.text[:400]}"
+            return True, (
+                f"Опубликовано: {len(raw)/1024/1024:.1f} МБ → "
+                f"{len(compressed)/1024:.0f} КБ (gzip)."
+            )
+        return False, f"Ошибка GitHub API ({r.status_code}): {r.text[:500]}"
     except Exception as e:
         return False, str(e)
 
 
-def _dt_to_str(v):
-    if pd.isna(v):
+def _dt_str(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
         return None
     try:
         return pd.Timestamp(v).strftime("%Y-%m-%d")
@@ -121,28 +183,33 @@ def _dt_to_str(v):
 
 
 def snapshot_from_frames(dz: pd.DataFrame, unissued: pd.DataFrame) -> dict:
-    """В снимок кладём строки ДЗ/ДО — чтобы фильтры работали у всех."""
+    """Полный снимок: те же данные, что видит администратор."""
     dz_cols = [
         "Контрагент", "Плательщик", "Заявка", "Номер счета",
         "Дата счета", "Дата оплаты по договору", "Просрочка, дни",
         "Сумма счета", "Оплачено", "Остаток",
         "Просрочено", "Подходит к оплате", "Не отправлено", "Дата отправления",
     ]
-    dz_export = dz[[c for c in dz_cols if c in dz.columns]].copy()
+    dz_out = dz[[c for c in dz_cols if c in dz.columns]].copy()
     for c in ("Дата счета", "Дата оплаты по договору", "Дата отправления"):
-        if c in dz_export.columns:
-            dz_export[c] = dz_export[c].map(_dt_to_str)
+        if c in dz_out.columns:
+            dz_out[c] = dz_out[c].map(_dt_str)
+    for c in dz_out.select_dtypes(include="float").columns:
+        dz_out[c] = dz_out[c].round(2)
 
     un_cols = ["Контрагент", "Заявка", "Сумма", "Дата загрузки", "Дата заявки", "Бухгалтер"]
-    un_export = unissued[[c for c in un_cols if c in unissued.columns]].copy()
+    un_out = unissued[[c for c in un_cols if c in unissued.columns]].copy()
     for c in ("Дата загрузки", "Дата заявки"):
-        if c in un_export.columns:
-            un_export[c] = un_export[c].map(_dt_to_str)
+        if c in un_out.columns:
+            un_out[c] = un_out[c].map(_dt_str)
+    if "Сумма" in un_out.columns:
+        un_out["Сумма"] = un_out["Сумма"].round(2)
 
     return {
+        "version": 3,
         "published_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "dz": dz_export.to_dict(orient="records"),
-        "unissued": un_export.to_dict(orient="records"),
+        "dz": json.loads(dz_out.to_json(orient="records", force_ascii=False)),
+        "unissued": json.loads(un_out.to_json(orient="records", force_ascii=False)),
     }
 
 
@@ -152,20 +219,22 @@ def frames_from_snapshot(snap: dict):
     for c in ("Дата счета", "Дата оплаты по договору", "Дата отправления"):
         if c in dz.columns:
             dz[c] = pd.to_datetime(dz[c], errors="coerce")
+    for c in (
+        "Сумма счета", "Оплачено", "Остаток", "Просрочено",
+        "Подходит к оплате", "Не отправлено", "Просрочка, дни",
+    ):
+        if c in dz.columns:
+            dz[c] = pd.to_numeric(dz[c], errors="coerce").fillna(0)
     for c in ("Дата загрузки", "Дата заявки"):
         if c in unissued.columns:
             unissued[c] = pd.to_datetime(unissued[c], errors="coerce")
-    for c in ("Сумма счета", "Оплачено", "Остаток", "Просрочено", "Подходит к оплате",
-              "Не отправлено", "Просрочка, дни"):
-        if c in dz.columns:
-            dz[c] = pd.to_numeric(dz[c], errors="coerce").fillna(0)
     if "Сумма" in unissued.columns:
         unissued["Сумма"] = pd.to_numeric(unissued["Сумма"], errors="coerce").fillna(0)
     return dz, unissued
 
 
 # -----------------------------------------------------------------------------
-# Excel utils
+# Excel / расчёты
 # -----------------------------------------------------------------------------
 def normalize_xlsx(file_bytes: bytes) -> io.BytesIO:
     src = io.BytesIO(file_bytes)
@@ -223,9 +292,6 @@ def rub(value):
         return "—"
 
 
-# -----------------------------------------------------------------------------
-# Расчёты
-# -----------------------------------------------------------------------------
 def build_dz(raw):
     c_payer = find_col(raw, "Плательщик")
     c_client = find_col(raw, "Заявка.Контрагент", "Контрагент")
@@ -260,7 +326,6 @@ def build_dz(raw):
         "Дата отправления": to_date(raw[c_sent]) if c_sent else pd.NaT,
         "Исходный документ": invoice_text.astype(str),
     })
-
     df = df[
         (df["Контрагент"] != "")
         & (df["Контрагент"].str.lower() != "nan")
@@ -268,7 +333,6 @@ def build_dz(raw):
         & (df["Контрагент"].str.lower() != "итого")
         & (df["Сумма счета"] != 0)
     ].copy()
-
     df["Остаток"] = (df["Сумма счета"] - df["Оплачено"]).clip(lower=0)
     no_sent = df["Дата отправления"].isna()
     is_late = df["Просрочка, дни"] > 0
@@ -286,18 +350,11 @@ def build_unissued(raw_do):
     c_load = find_col(raw_do, "Дата загрузки")
     c_date = find_col(raw_do, "Дата")
     c_manager = find_col(raw_do, "Клиентский бухгалтер", "Менеджер")
-
     if c_client is None or c_amount is None:
         raise ValueError("В файле ДО не найдены «Клиент» и/или «Ставка заказчика».")
-
     amount = number(raw_do[c_amount])
     invoice = raw_do[c_invoice].astype(str).str.strip() if c_invoice else pd.Series([""] * len(raw_do))
-    no_invoice = (
-        invoice.isna()
-        | (invoice == "")
-        | (invoice.str.lower() == "nan")
-        | (invoice.str.lower() == "none")
-    )
+    no_invoice = invoice.isna() | (invoice == "") | (invoice.str.lower() == "nan") | (invoice.str.lower() == "none")
     df = pd.DataFrame({
         "Контрагент": raw_do[c_client].astype(str).str.strip(),
         "Заявка": raw_do[c_request] if c_request else "",
@@ -307,51 +364,38 @@ def build_unissued(raw_do):
         "Дата заявки": to_date(raw_do[c_date]) if c_date else pd.NaT,
         "Бухгалтер": raw_do[c_manager].astype(str).str.strip() if c_manager else "",
     })
-    df = df[
-        no_invoice
-        & (df["Контрагент"] != "")
-        & (df["Контрагент"].str.lower() != "nan")
-        & (df["Сумма"] != 0)
+    return df[
+        no_invoice & (df["Контрагент"] != "") & (df["Контрагент"].str.lower() != "nan") & (df["Сумма"] != 0)
     ].copy()
-    return df
 
 
-def build_summary(dz: pd.DataFrame, unissued: pd.DataFrame) -> pd.DataFrame:
+def build_summary(dz, unissued):
     if dz is None or dz.empty:
         issued = pd.DataFrame(columns=[
-            "Контрагент", "Выставлено", "Оплачено", "Просрочено",
-            "Подходит к оплате", "Не отправлено",
+            "Контрагент", "Выставлено", "Оплачено", "Просрочено", "Подходит к оплате", "Не отправлено",
         ])
     else:
-        issued = (
-            dz.groupby("Контрагент", as_index=False)
-            .agg(
-                Выставлено=("Сумма счета", "sum"),
-                Оплачено=("Оплачено", "sum"),
-                Просрочено=("Просрочено", "sum"),
-                **{"Подходит к оплате": ("Подходит к оплате", "sum")},
-                **{"Не отправлено": ("Не отправлено", "sum")},
-            )
+        issued = dz.groupby("Контрагент", as_index=False).agg(
+            Выставлено=("Сумма счета", "sum"),
+            Оплачено=("Оплачено", "sum"),
+            Просрочено=("Просрочено", "sum"),
+            **{"Подходит к оплате": ("Подходит к оплате", "sum")},
+            **{"Не отправлено": ("Не отправлено", "sum")},
         )
     if unissued is None or unissued.empty:
         not_issued = pd.DataFrame(columns=["Контрагент", "Не выставлено"])
     else:
-        not_issued = (
-            unissued.groupby("Контрагент", as_index=False)
-            .agg(**{"Не выставлено": ("Сумма", "sum")})
-        )
+        not_issued = unissued.groupby("Контрагент", as_index=False).agg(**{"Не выставлено": ("Сумма", "sum")})
     summary = issued.merge(not_issued, on="Контрагент", how="outer").fillna(0)
     summary["Оборот"] = summary["Выставлено"] + summary["Не выставлено"]
-    summary = summary[
-        [
-            "Контрагент", "Оборот", "Выставлено", "Оплачено",
-            "Просрочено", "Подходит к оплате", "Не отправлено", "Не выставлено",
-        ]
-    ]
+    summary = summary[[
+        "Контрагент", "Оборот", "Выставлено", "Оплачено",
+        "Просрочено", "Подходит к оплате", "Не отправлено", "Не выставлено",
+    ]]
     return summary.sort_values("Оборот", ascending=False).reset_index(drop=True)
 
 
-def build_payment_plan(dz: pd.DataFrame) -> pd.DataFrame:
+def build_payment_plan(dz):
     if dz is None or dz.empty:
         return pd.DataFrame()
     plan = dz[(dz["Остаток"] > 0) & dz["Дата оплаты по договору"].notna()].copy()
@@ -360,38 +404,24 @@ def build_payment_plan(dz: pd.DataFrame) -> pd.DataFrame:
     iso = plan["Дата оплаты по договору"].dt.isocalendar()
     plan["Неделя"] = iso["year"].astype(str) + "-W" + iso["week"].astype(str).str.zfill(2)
     pivot = (
-        plan.groupby(["Контрагент", "Неделя"], as_index=False)["Остаток"]
-        .sum()
-        .pivot(index="Контрагент", columns="Неделя", values="Остаток")
-        .fillna(0)
+        plan.groupby(["Контрагент", "Неделя"], as_index=False)["Остаток"].sum()
+        .pivot(index="Контрагент", columns="Неделя", values="Остаток").fillna(0)
     )
-    week_cols = sorted(pivot.columns.tolist())
-    pivot = pivot[week_cols]
+    pivot = pivot[sorted(pivot.columns.tolist())]
     pivot["Итого"] = pivot.sum(axis=1)
     return pivot.sort_values("Итого", ascending=False)
 
 
-def metrics_from_summary(summary_f: pd.DataFrame) -> dict:
+def metrics_from_summary(summary_f):
+    keys = ["Оборот", "Выставлено", "Оплачено", "Просрочено", "Подходит к оплате", "Не отправлено", "Не выставлено"]
     if summary_f is None or summary_f.empty:
-        return {k: 0.0 for k in [
-            "Оборот", "Выставлено", "Оплачено", "Просрочено",
-            "Подходит к оплате", "Не отправлено", "Не выставлено",
-        ]}
-    return {
-        "Оборот": float(summary_f["Оборот"].sum()),
-        "Выставлено": float(summary_f["Выставлено"].sum()),
-        "Оплачено": float(summary_f["Оплачено"].sum()),
-        "Просрочено": float(summary_f["Просрочено"].sum()),
-        "Подходит к оплате": float(summary_f["Подходит к оплате"].sum()),
-        "Не отправлено": float(summary_f["Не отправлено"].sum()),
-        "Не выставлено": float(summary_f["Не выставлено"].sum()),
-    }
+        return {k: 0.0 for k in keys}
+    return {k: float(summary_f[k].sum()) if k in summary_f.columns else 0.0 for k in keys}
 
 
 def apply_filters(dz, unissued, clients, payers, invoice_range):
     dz_f = dz.copy() if dz is not None else pd.DataFrame()
     un_f = unissued.copy() if unissued is not None else pd.DataFrame()
-
     if clients:
         if not dz_f.empty:
             dz_f = dz_f[dz_f["Контрагент"].isin(clients)]
@@ -407,9 +437,9 @@ def apply_filters(dz, unissued, clients, payers, invoice_range):
 
 
 # -----------------------------------------------------------------------------
-# UI helpers
+# Отрисовка (одинаковая для админа и просмотра)
 # -----------------------------------------------------------------------------
-def render_kpi(metrics: dict):
+def render_kpi(metrics):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Оборот", rub(metrics.get("Оборот", 0)))
     c2.metric("Выставлено (Сумма по счету)", rub(metrics.get("Выставлено", 0)))
@@ -419,30 +449,6 @@ def render_kpi(metrics: dict):
     c5.metric("Просрочено", rub(metrics.get("Просрочено", 0)))
     c6.metric("Подходит к оплате", rub(metrics.get("Подходит к оплате", 0)))
     c7.metric("Не отправлено", rub(metrics.get("Не отправлено", 0)))
-
-
-def render_payment_plan(plan_df: pd.DataFrame):
-    st.subheader("Планирование оплат по неделям")
-    st.caption(
-        "Остаток к оплате по ISO-неделе «Даты оплаты по договору». "
-        "Пример: 24.11.2026 и 26.11.2026 → неделя 2026-W48, суммы складываются."
-    )
-    if plan_df is None or plan_df.empty:
-        st.info("Нет строк с остатком и датой оплаты по договору.")
-        return
-    st.dataframe(plan_df.style.format("{:,.2f}"), use_container_width=True, height=520)
-    csv = plan_df.reset_index().to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("Скачать план оплат (CSV)", data=csv,
-                       file_name="план_оплат_по_неделям.csv", mime="text/csv", key="dl_plan_csv")
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        plan_df.reset_index().to_excel(writer, index=False, sheet_name="План оплат")
-    st.download_button(
-        "Скачать план оплат (Excel)", data=buf.getvalue(),
-        file_name="план_оплат_по_неделям.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_plan_xlsx",
-    )
 
 
 def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label=""):
@@ -467,7 +473,12 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
             st.info("Нет данных.")
 
     with tabs[1]:
-        render_payment_plan(plan_df)
+        st.subheader("Планирование оплат по неделям")
+        st.caption("Остаток по ISO-неделе «Даты оплаты по договору» (24.11.2026 → 2026-W48).")
+        if plan_df is None or plan_df.empty:
+            st.info("Нет строк с остатком и датой оплаты по договору.")
+        else:
+            st.dataframe(plan_df.style.format("{:,.2f}"), use_container_width=True, height=520)
 
     with tabs[2]:
         left, right = st.columns(2)
@@ -482,46 +493,33 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
             })
             status = status[status["Сумма"] > 0]
             if not status.empty:
-                fig = px.pie(status, names="Категория", values="Сумма", hole=0.5,
-                             title="Структура: оплачено и остатки")
+                fig = px.pie(status, names="Категория", values="Сумма", hole=0.5, title="Структура")
                 st.plotly_chart(fig, use_container_width=True)
         with right:
             bar_df = pd.DataFrame({
-                "Показатель": [
-                    "Выставлено", "Оплачено", "Просрочено",
-                    "Подходит к оплате", "Не отправлено", "Не выставлено",
-                ],
+                "Показатель": ["Выставлено", "Оплачено", "Просрочено", "Подходит к оплате", "Не отправлено", "Не выставлено"],
                 "Сумма": [
-                    metrics.get("Выставлено", 0), metrics.get("Оплачено", 0),
-                    metrics.get("Просрочено", 0), metrics.get("Подходит к оплате", 0),
-                    metrics.get("Не отправлено", 0), metrics.get("Не выставлено", 0),
+                    metrics.get("Выставлено", 0), metrics.get("Оплачено", 0), metrics.get("Просрочено", 0),
+                    metrics.get("Подходит к оплате", 0), metrics.get("Не отправлено", 0), metrics.get("Не выставлено", 0),
                 ],
             })
-            fig = px.bar(bar_df, x="Показатель", y="Сумма", title="Ключевые показатели",
-                         labels={"Сумма": "Сумма, ₽"})
+            fig = px.bar(bar_df, x="Показатель", y="Сумма", title="Ключевые показатели", labels={"Сумма": "Сумма, ₽"})
             st.plotly_chart(fig, use_container_width=True)
 
         if summary_f is not None and not summary_f.empty:
-            top = summary_f.nlargest(15, "Оборот")
-            fig = px.bar(
-                top.sort_values("Оборот"), x="Оборот", y="Контрагент", orientation="h",
-                title="Топ-15 контрагентов по обороту", labels={"Оборот": "Оборот, ₽"},
-            )
+            top = summary_f.nlargest(min(15, len(summary_f)), "Оборот")
+            fig = px.bar(top.sort_values("Оборот"), x="Оборот", y="Контрагент", orientation="h",
+                         title="Топ контрагентов по обороту", labels={"Оборот": "Оборот, ₽"})
             st.plotly_chart(fig, use_container_width=True)
 
         if dz_f is not None and not dz_f.empty and "Дата счета" in dz_f.columns and dz_f["Дата счета"].notna().any():
             monthly = dz_f.dropna(subset=["Дата счета"]).copy()
             monthly["Месяц"] = monthly["Дата счета"].dt.to_period("M").dt.to_timestamp()
             monthly = monthly.groupby("Месяц", as_index=False).agg(
-                Выставлено=("Сумма счета", "sum"),
-                Оплачено=("Оплачено", "sum"),
-                Просрочено=("Просрочено", "sum"),
+                Выставлено=("Сумма счета", "sum"), Оплачено=("Оплачено", "sum"), Просрочено=("Просрочено", "sum"),
             )
-            fig = px.line(
-                monthly, x="Месяц", y=["Выставлено", "Оплачено", "Просрочено"], markers=True,
-                title="Динамика по месяцам (дата счёта, ДЗ)",
-                labels={"value": "Сумма, ₽", "variable": "Показатель"},
-            )
+            fig = px.line(monthly, x="Месяц", y=["Выставлено", "Оплачено", "Просрочено"], markers=True,
+                          title="Динамика по месяцам", labels={"value": "Сумма, ₽", "variable": "Показатель"})
             st.plotly_chart(fig, use_container_width=True)
 
     with tabs[3]:
@@ -542,10 +540,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
                 "Остаток", "Просрочено", "Подходит к оплате", "Не отправлено", "Дата отправления",
             ] if c in view.columns]
             st.dataframe(
-                view[cols].sort_values(
-                    [c for c in ["Дата счета", "Контрагент"] if c in view.columns],
-                    ascending=[False, True],
-                ),
+                view[cols].sort_values([c for c in ["Дата счета", "Контрагент"] if c in view.columns], ascending=[False, True]),
                 use_container_width=True, hide_index=True, height=420,
             )
         else:
@@ -553,10 +548,8 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
 
         if unissued_f is not None and not unissued_f.empty:
             st.subheader("Невыставленные заявки (ДО)")
-            st.dataframe(
-                unissued_f.sort_values("Сумма", ascending=False),
-                use_container_width=True, hide_index=True, height=320,
-            )
+            st.dataframe(unissued_f.sort_values("Сумма", ascending=False),
+                         use_container_width=True, hide_index=True, height=320)
 
     with tabs[4]:
         if summary_f is not None and not summary_f.empty:
@@ -572,18 +565,14 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
                 if unissued_f is not None and not unissued_f.empty:
                     unissued_f.to_excel(writer, index=False, sheet_name="Не выставлено")
             st.download_button(
-                "Скачать Excel (сводка + план + детализация)",
-                data=buf.getvalue(), file_name="Отчет_ДЗ_ДО.xlsx",
+                "Скачать Excel", data=buf.getvalue(), file_name="Отчет_ДЗ_ДО.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
 
 # =============================================================================
-# Главный поток
-# =============================================================================
 st.title("📊 Финансовый дашборд ДЗ / ДО")
 
-# --- Админ: загрузка ---
 with st.sidebar:
     st.header("Режим")
     is_admin = False
@@ -603,9 +592,9 @@ with st.sidebar:
         dz_file = st.file_uploader("Файл ДЗ (.xlsx)", type=["xlsx"], key="dz")
         do_file = st.file_uploader("Файл ДО (.xlsx)", type=["xlsx"], key="do")
 
-# Базовые данные: либо свежая загрузка админа, либо опубликованный снимок
+# Источник: живые файлы админа ИЛИ полный опубликованный снимок
 base_dz = base_unissued = None
-source_mode = None  # "live" | "published"
+source_mode = None
 
 if is_admin and dz_file and do_file:
     try:
@@ -616,75 +605,48 @@ if is_admin and dz_file and do_file:
         st.error(f"Не удалось обработать файлы: {exc}")
 
 if base_dz is None:
-    published = load_published_snapshot()
-    if published is not None and published.get("dz") is not None:
-        base_dz, base_unissued = frames_from_snapshot(published)
+    snap = load_published_snapshot()
+    if snap is not None and snap.get("dz") is not None:
+        base_dz, base_unissued = frames_from_snapshot(snap)
         source_mode = "published"
-        st.sidebar.caption(f"Опубликовано: {published.get('published_at', '—')}")
-    elif published is not None and published.get("summary"):
-        # Старый формат снимка (только summary) — без полноценных фильтров по датам
+        st.sidebar.caption(f"Опубликовано: {snap.get('published_at', '—')}")
+    elif snap is not None:
         st.warning(
-            "Опубликован старый формат снимка. Администратору нужно "
-            "заново загрузить файлы и нажать «Опубликовать», "
-            "чтобы фильтры работали у всех."
+            "Найден снимок старого формата (без полных строк). "
+            "Администратор: загрузите файлы и нажмите «Опубликовать» ещё раз."
         )
-        summary_old = pd.DataFrame(published.get("summary", []))
-        metrics_old = published.get("metrics") or metrics_from_summary(summary_old)
-        plan_old = pd.DataFrame(published.get("payment_plan", []))
-        if not plan_old.empty and "Контрагент" in plan_old.columns:
-            plan_old = plan_old.set_index("Контрагент")
-        with st.sidebar:
-            st.header("Фильтры")
-            if not summary_old.empty and "Контрагент" in summary_old.columns:
-                clients = sorted(summary_old["Контрагент"].dropna().unique().tolist())
-                sel = st.multiselect("Контрагент", clients, default=[])
-                if sel:
-                    summary_old = summary_old[summary_old["Контрагент"].isin(sel)]
-                    metrics_old = metrics_from_summary(summary_old)
-                    if not plan_old.empty:
-                        plan_old = plan_old.loc[plan_old.index.isin(sel)]
-        render_dashboard(summary_old, metrics_old, plan_old, None, None,
-                         source_label=f"Опубликованные данные (старый снимок) · {published.get('published_at', '—')}")
         st.stop()
 
 if base_dz is None:
     st.info(
         "Нет данных для отображения.\n\n"
-        "Администратор: пароль → загрузка «дз.xlsx» и «до.xlsx» → «Опубликовать для руководства»."
+        "Администратор: пароль → дз.xlsx + до.xlsx → «Опубликовать для руководства»."
     )
     st.stop()
 
-# --- Фильтры для ВСЕХ ---
+# Фильтры — у всех одинаковые
 with st.sidebar:
     st.divider()
     st.header("Фильтры")
-
-    all_clients = set(base_dz["Контрагент"].dropna().unique().tolist()) if not base_dz.empty else set()
+    all_clients = set(base_dz["Контрагент"].dropna().unique().tolist())
     if base_unissued is not None and not base_unissued.empty:
         all_clients |= set(base_unissued["Контрагент"].dropna().unique().tolist())
     clients = sorted(all_clients)
     selected_clients = st.multiselect("Контрагент", clients, default=[])
 
-    payers = []
-    if not base_dz.empty and "Плательщик" in base_dz.columns:
-        payers = sorted([
-            x for x in base_dz["Плательщик"].dropna().unique().tolist()
-            if x and str(x).lower() not in ("nan", "none")
-        ])
+    payers = sorted([
+        x for x in base_dz["Плательщик"].dropna().unique().tolist()
+        if x and str(x).lower() not in ("nan", "none")
+    ]) if "Плательщик" in base_dz.columns else []
     selected_payers = st.multiselect("Плательщик", payers, default=[]) if payers else []
 
     invoice_range = None
-    if not base_dz.empty and "Дата счета" in base_dz.columns:
-        valid_inv = base_dz["Дата счета"].dropna()
-        if not valid_inv.empty:
-            min_d, max_d = valid_inv.min().date(), valid_inv.max().date()
-            invoice_range = st.date_input(
-                "Дата счёта",
-                value=(min_d, max_d),
-                min_value=min_d,
-                max_value=max_d,
-                key="invoice_date",
-            )
+    valid_inv = base_dz["Дата счета"].dropna() if "Дата счета" in base_dz.columns else pd.Series(dtype="datetime64[ns]")
+    if not valid_inv.empty:
+        min_d, max_d = valid_inv.min().date(), valid_inv.max().date()
+        invoice_range = st.date_input(
+            "Дата счёта", value=(min_d, max_d), min_value=min_d, max_value=max_d, key="invoice_date",
+        )
 
 dz_f, unissued_f = apply_filters(base_dz, base_unissued, selected_clients, selected_payers, invoice_range)
 summary_f = build_summary(dz_f, unissued_f)
@@ -695,42 +657,34 @@ st.sidebar.caption(
     f"Строк ДЗ: {len(dz_f):,} · невыставленных: {len(unissued_f):,}".replace(",", " ")
 )
 
-# --- Публикация (только админ + живые файлы) ---
+# Публикация — только админ с живыми файлами
 if is_admin and source_mode == "live":
     st.sidebar.divider()
     if not PUBLISH_ENABLED:
         st.sidebar.warning("Публикация не настроена (secrets).")
-    else:
-        # Публикуем полный набор БЕЗ фильтров — чтобы у всех был полный срез,
-        # а фильтры каждый настраивает у себя.
-        if st.sidebar.button("📢 Опубликовать для руководства", type="primary"):
-            snap = snapshot_from_frames(base_dz, base_unissued)
-            ok, msg = publish_snapshot(snap)
+    elif st.sidebar.button("📢 Опубликовать для руководства", type="primary"):
+        with st.sidebar:
+            with st.spinner("Сжатие и загрузка снимка на GitHub…"):
+                snap = snapshot_from_frames(base_dz, base_unissued)
+                ok, msg = publish_snapshot(snap)
             if ok:
-                st.sidebar.success(msg)
+                st.success(msg)
                 st.balloons()
             else:
-                st.sidebar.error(msg)
+                st.error(msg)
 
-label = (
-    "Данные из загруженных файлов (черновик)"
-    if source_mode == "live"
-    else f"Опубликованные данные"
-)
+label = "Данные из загруженных файлов" if source_mode == "live" else "Опубликованные данные (полный снимок)"
 render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label=label)
 
 with st.expander("Пояснения"):
     st.markdown(
         """
-**Фильтры** доступны и администратору, и тем, кто открыл ссылку:
-- Контрагент
-- Плательщик
-- Дата счёта
+По ссылке и у администратора отображаются **одинаковые** данные:
+сводка, план оплат, аналитика, детализация, фильтры.
 
-**Планирование оплат** — остаток по ISO-неделе даты оплаты по договору
-(24.11.2026 → 2026-W48; несколько платежей в одной неделе суммируются).
+Отличие только в том, что **загружать** `дз.xlsx` / `до.xlsx` и нажимать
+«Опубликовать» может только администратор (по паролю).
 
-**Публикация** сохраняет полный срез данных. Фильтры каждый применяет у себя.
+Снимок хранится в GitHub в сжатом виде (`data/published.json.gz`).
         """
     )
-
