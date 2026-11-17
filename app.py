@@ -10,7 +10,7 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Финансовый дашборд ДЗ / ДО", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Дашборд по ДЗ", page_icon="📊", layout="wide")
 
 # =============================================================================
 # Secrets (Streamlit Cloud → Settings → Secrets)
