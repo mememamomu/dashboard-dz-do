@@ -285,7 +285,7 @@ def build_dz(raw):
     ].copy()
     df["Остаток"] = (df["Сумма счета"] - df["Оплачено"]).clip(lower=0)
     no_sent = df["Дата отправления"].isna()
-    is_late = df["Просрочка, дни"] < 0
+    is_late = df["Просрочка, дни"] > 0
     df["Не отправлено"] = df["Остаток"].where(no_sent, 0)
     df["Просрочено"] = df["Остаток"].where(~no_sent & is_late, 0)
     df["Подходит к оплате"] = df["Остаток"].where(~no_sent & ~is_late, 0)
