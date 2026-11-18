@@ -283,11 +283,9 @@ def snapshot_from_frames(dz: pd.DataFrame, unissued: pd.DataFrame) -> dict:
     }
 
 
-@st.cache_data(show_spinner="Подготовка данных…")
-def _frames_from_snapshot_cached(published_at: str, dz_json: str, unissued_json: str):
-    """Кэш разбора снимка — повторные фильтры не парсят JSON заново."""
-    dz = pd.read_json(io.StringIO(dz_json), orient="records") if dz_json else pd.DataFrame()
-    unissued = pd.read_json(io.StringIO(unissued_json), orient="records") if unissued_json else pd.DataFrame()
+def frames_from_snapshot(snap: dict):
+    dz = pd.DataFrame(snap.get("dz", []))
+    unissued = pd.DataFrame(snap.get("unissued", []))
     for c in ("Дата счета", "Дата оплаты по договору", "Дата отправления"):
         if c in dz.columns:
             dz[c] = pd.to_datetime(dz[c], errors="coerce")
@@ -303,12 +301,6 @@ def _frames_from_snapshot_cached(published_at: str, dz_json: str, unissued_json:
     unissued = ensure_unissued_categories(unissued)
     return dz, unissued
 
-
-def frames_from_snapshot(snap: dict):
-    published_at = str(snap.get("published_at", ""))
-    dz_json = json.dumps(snap.get("dz", []), ensure_ascii=False)
-    unissued_json = json.dumps(snap.get("unissued", []), ensure_ascii=False)
-    return _frames_from_snapshot_cached(published_at, dz_json, unissued_json)
 
 
 def normalize_xlsx(file_bytes: bytes) -> io.BytesIO:
@@ -542,18 +534,13 @@ def build_summary(dz, unissued):
     return summary.sort_values("Оборот", ascending=False).reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False)
-def _build_payment_plan_cached(n_rows: int, payload: str):
-    df = pd.read_json(io.StringIO(payload), orient="records")
-    if "Дата оплаты по договору" in df.columns:
-        df["Дата оплаты по договору"] = pd.to_datetime(df["Дата оплаты по договору"], errors="coerce")
-    for c in ("Остаток", "Просрочено"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    return build_payment_plan(df)
-
-
 def build_payment_plan(dz):
+    """
+    План оплат:
+    - недели — только непросроченные остатки (дни просрочки >= 0) с датой оплаты по договору;
+    - «Просрочка» — просроченные суммы;
+    - «Общая задолженность (непросроченная)» — сразу после контрагента.
+    """
     if dz is None or dz.empty:
         return pd.DataFrame()
     if "Просрочено" not in dz.columns or "Остаток" not in dz.columns:
@@ -561,40 +548,56 @@ def build_payment_plan(dz):
 
     overdue = dz.groupby("Контрагент", as_index=True)["Просрочено"].sum().rename("Просрочка")
 
-    plan = dz[(dz["Остаток"] > 0) & dz["Дата оплаты по договору"].notna()].copy()
-    if plan.empty:
-        if overdue.sum() == 0:
-            return pd.DataFrame()
+    # Непросроченный остаток с ПДО (для недель и общей задолженности)
+    non_overdue = dz[
+        (dz["Остаток"] > 0)
+        & dz["Дата оплаты по договору"].notna()
+        & (dz["Просрочка, дни"] >= 0)
+    ].copy()
+
+    if non_overdue.empty and overdue.sum() == 0:
+        return pd.DataFrame()
+
+    if non_overdue.empty:
         result = overdue.to_frame()
         result = result[result["Просрочка"] > 0].sort_values("Просрочка", ascending=False)
-        total = pd.DataFrame({"Просрочка": [result["Просрочка"].sum()]}, index=["ИТОГО"])
+        result.insert(0, "Общая задолженность (непросроченная)", 0.0)
+        total = result.sum(axis=0).to_frame().T
+        total.index = ["ИТОГО"]
         return pd.concat([total, result])
 
-    plan["Неделя"] = plan["Дата оплаты по договору"].map(isocal_week_label)
+    non_overdue["Неделя"] = non_overdue["Дата оплаты по договору"].map(isocal_week_label)
     pivot = (
-        plan.groupby(["Контрагент", "Неделя"], as_index=False)["Остаток"].sum()
+        non_overdue.groupby(["Контрагент", "Неделя"], as_index=False)["Остаток"].sum()
         .pivot(index="Контрагент", columns="Неделя", values="Остаток")
         .fillna(0)
     )
     week_cols = sorted([c for c in pivot.columns if c is not None])
     pivot = pivot[week_cols]
+
+    # Непросроченная задолженность = сумма по неделям
+    pivot.insert(0, "Общая задолженность (непросроченная)", pivot[week_cols].sum(axis=1) if week_cols else 0.0)
+
     pivot = pivot.join(overdue, how="left")
     pivot["Просрочка"] = pivot["Просрочка"].fillna(0)
 
+    # Клиенты только с просрочкой
     only_overdue = overdue[~overdue.index.isin(pivot.index)]
     only_overdue = only_overdue[only_overdue > 0]
     if not only_overdue.empty:
-        extra = pd.DataFrame(0.0, index=only_overdue.index, columns=week_cols)
+        extra = pd.DataFrame(0.0, index=only_overdue.index, columns=["Общая задолженность (непросроченная)"] + week_cols)
         extra["Просрочка"] = only_overdue
         pivot = pd.concat([pivot, extra])
 
-    pivot["Итого"] = pivot[week_cols].sum(axis=1) if week_cols else 0
-    ordered = ["Просрочка"] + week_cols + ["Итого"]
-    pivot = pivot[ordered].sort_values("Итого", ascending=False)
+    # Порядок: Общая задолженность → Просрочка → недели
+    ordered = ["Общая задолженность (непросроченная)", "Просрочка"] + week_cols
+    ordered = [c for c in ordered if c in pivot.columns]
+    pivot = pivot[ordered].sort_values("Общая задолженность (непросроченная)", ascending=False)
 
     total_row = pivot.sum(axis=0).to_frame().T
     total_row.index = ["ИТОГО"]
     return pd.concat([total_row, pivot])
+
 
 
 def metrics_from_summary(summary_f):
@@ -650,6 +653,78 @@ def render_kpi(metrics):
             col.metric(label, rub(metrics.get(key, 0)))
 
 
+@st.fragment
+def render_plan_tab(plan_df):
+    """Смена фильтров плана не пересчитывает весь дашборд."""
+    st.subheader("Планирование оплат по неделям")
+    st.caption(
+        "«Общая задолженность (непросроченная)» — остатки с ПДО, ещё не просроченные. "
+        "«Просрочка» — просроченные суммы. Фильтры ниже не перезагружают остальные разделы."
+    )
+    if plan_df is None or plan_df.empty:
+        st.info("Нет данных для плана оплат.")
+        return
+
+    debt_col = "Общая задолженность (непросроченная)"
+    client_index = [i for i in plan_df.index if str(i) != "ИТОГО"]
+    week_cols = [
+        c for c in plan_df.columns
+        if c not in (debt_col, "Просрочка", "Итого") and str(c).startswith("20")
+    ]
+
+    f1, f2 = st.columns(2)
+    with f1:
+        sel_clients = st.multiselect("Контрагент", options=client_index, default=[], key="plan_clients")
+    with f2:
+        sel_weeks = st.multiselect("Неделя", options=week_cols, default=[], key="plan_weeks")
+
+    view = plan_df
+    if sel_clients:
+        body = plan_df.loc[[i for i in plan_df.index if i in sel_clients]]
+        if not body.empty:
+            total = body.sum(axis=0).to_frame().T
+            total.index = ["ИТОГО"]
+            view = pd.concat([total, body])
+        else:
+            view = plan_df.iloc[0:0]
+
+    # Столбцы: задолженность, просрочка, выбранные недели
+    fixed = [c for c in [debt_col, "Просрочка"] if c in view.columns]
+    if sel_weeks:
+        show_weeks = [w for w in sel_weeks if w in view.columns]
+    else:
+        show_weeks = week_cols
+
+    view = view.copy()
+    # Пересчёт непросроченной задолженности по видимым неделям
+    if debt_col in view.columns:
+        if show_weeks:
+            view[debt_col] = view[show_weeks].sum(axis=1)
+        else:
+            view[debt_col] = 0.0
+
+    cols_show = [c for c in (fixed + show_weeks) if c in view.columns]
+    view = view[cols_show]
+
+    body_rows = [i for i in view.index if str(i) != "ИТОГО"]
+    body = view.loc[body_rows] if body_rows else view.iloc[0:0]
+    # Сумма к оплате = непросроченная по выбранным неделям
+    if debt_col in body.columns and not body.empty:
+        extra_sum = float(pd.to_numeric(body[debt_col], errors="coerce").fillna(0).sum())
+    else:
+        week_cols_show = [c for c in body.columns if str(c).startswith("20")]
+        extra_sum = float(body[week_cols_show].to_numpy().sum()) if (not body.empty and week_cols_show) else 0.0
+
+    st.metric("Сумма к оплате по выбранным параметрам (непросроченная)", rub(extra_sum))
+    st.caption(
+        ("контрагентов: " + str(len(sel_clients)) if sel_clients else "все контрагенты")
+        + " · "
+        + ("недели: " + ", ".join(sel_weeks) if sel_weeks else "все недели")
+    )
+    st.dataframe(format_money_df(view), use_container_width=True, height=520)
+
+
+
 def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label=""):
     if source_label:
         st.caption(source_label)
@@ -675,97 +750,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
             st.info("Нет данных.")
 
     with tabs[1]:
-        st.subheader("Планирование оплат по неделям")
-        st.caption(
-            "Строка ИТОГО — суммы по неделям. Столбец «Просрочка» — просроченные остатки. "
-            "Фильтры ниже работают только в этом разделе."
-        )
-
-        if plan_df is None or plan_df.empty:
-            st.info("Нет данных для плана оплат.")
-        else:
-            plan_view = plan_df.copy()
-
-            # Контрагенты без строки ИТОГО
-            client_index = [i for i in plan_view.index if str(i) != "ИТОГО"]
-            # Столбцы недель вида 2026-W15
-            week_cols = [
-                c for c in plan_view.columns
-                if c not in ("Просрочка", "Итого") and str(c).startswith("20")
-            ]
-
-            f1, f2 = st.columns(2)
-            with f1:
-                sel_clients = st.multiselect(
-                    "Контрагент",
-                    options=client_index,
-                    default=[],
-                    key="plan_clients",
-                )
-            with f2:
-                sel_weeks = st.multiselect(
-                    "Неделя",
-                    options=week_cols,
-                    default=[],
-                    key="plan_weeks",
-                )
-
-            # Фильтр по контрагентам + пересчёт ИТОГО
-            if sel_clients:
-                body = plan_view.loc[[i for i in plan_view.index if i in sel_clients]]
-                if not body.empty:
-                    total = body.sum(axis=0).to_frame().T
-                    total.index = ["ИТОГО"]
-                    plan_view = pd.concat([total, body])
-                else:
-                    plan_view = plan_view.iloc[0:0]
-
-            # Какие недели показывать
-            base_cols = [c for c in ["Просрочка"] if c in plan_view.columns]
-            if sel_weeks:
-                show_weeks = [w for w in sel_weeks if w in plan_view.columns]
-            else:
-                show_weeks = [
-                    c for c in plan_view.columns
-                    if c not in ("Просрочка", "Итого")
-                ]
-
-            # Итого = сумма только по выбранным неделям
-            plan_view = plan_view.copy()
-            if show_weeks:
-                plan_view["Итого"] = plan_view[show_weeks].sum(axis=1)
-            tail = [c for c in ["Итого"] if c in plan_view.columns]
-            cols_show = base_cols + show_weeks + tail
-            cols_show = [c for c in cols_show if c in plan_view.columns]
-            plan_view = plan_view[cols_show]
-
-            # Сумма к оплате по выбранным параметрам (без «Просрочка»)
-            body_rows = [i for i in plan_view.index if str(i) != "ИТОГО"]
-            body = plan_view.loc[body_rows] if body_rows else plan_view.iloc[0:0]
-            week_cols_show = [c for c in body.columns if c not in ("Просрочка", "Итого")]
-            extra_sum = float(body[week_cols_show].sum().sum()) if (not body.empty and week_cols_show) else 0.0
-
-            label_parts = []
-            if sel_clients:
-                label_parts.append(f"контрагентов: {len(sel_clients)}")
-            else:
-                label_parts.append("все контрагенты")
-            if sel_weeks:
-                label_parts.append("недели: " + ", ".join(sel_weeks))
-            else:
-                label_parts.append("все недели")
-
-            st.metric(
-                "Сумма к оплате по выбранным параметрам",
-                f"{extra_sum:,.2f} ₽".replace(",", " ").replace(".", ","),
-            )
-            st.caption("Фильтр: " + " · ".join(label_parts))
-
-            st.dataframe(
-                format_money_df(plan_view),
-                use_container_width=True,
-                height=520,
-            )
+        render_plan_tab(plan_df)
 
     with tabs[2]:
         left, right = st.columns(2)
@@ -916,23 +901,58 @@ with st.sidebar:
 base_dz = base_unissued = None
 source_mode = None
 
+# session_state: данные грузим один раз, фильтры их не трогают
+need_reload = False
 if is_admin and dz_file and do_file:
+    file_key = f"{getattr(dz_file,'name','')}:{getattr(dz_file,'size',0)}:{getattr(do_file,'name','')}:{getattr(do_file,'size',0)}"
+    if st.session_state.get("_upload_key") != file_key:
+        need_reload = True
+        st.session_state["_upload_key"] = file_key
+        st.session_state.pop("base_dz", None)
+
+if (not need_reload and st.session_state.get("base_dz") is not None):
+    base_dz = st.session_state["base_dz"]
+    base_unissued = st.session_state["base_unissued"]
+    source_mode = st.session_state.get("source_mode", "published")
+    if source_mode == "published" and st.session_state.get("published_at"):
+        st.sidebar.caption(f"Опубликовано: {st.session_state['published_at']}")
+elif is_admin and dz_file and do_file:
     try:
-        base_dz = build_dz(read_source(dz_file, header_row=4))
-        base_unissued = build_unissued(read_source(do_file, header_row=4))
+        with st.spinner("Обработка Excel…"):
+            base_dz = build_dz(read_source(dz_file, header_row=4))
+            base_unissued = build_unissued(read_source(do_file, header_row=4))
         source_mode = "live"
+        st.session_state["base_dz"] = base_dz
+        st.session_state["base_unissued"] = base_unissued
+        st.session_state["source_mode"] = source_mode
+        st.session_state["published_at"] = None
     except Exception as exc:
         st.error(f"Не удалось обработать файлы: {exc}")
-
-if base_dz is None:
+else:
     snap = load_published_snapshot()
     if snap is not None and snap.get("dz") is not None:
-        base_dz, base_unissued = frames_from_snapshot(snap)
+        data_key = str(snap.get("published_at", ""))
+        if st.session_state.get("_data_key") == data_key and st.session_state.get("base_dz") is not None:
+            base_dz = st.session_state["base_dz"]
+            base_unissued = st.session_state["base_unissued"]
+        else:
+            with st.spinner("Подготовка данных…"):
+                base_dz, base_unissued = frames_from_snapshot(snap)
+            st.session_state["base_dz"] = base_dz
+            st.session_state["base_unissued"] = base_unissued
+            st.session_state["_data_key"] = data_key
         source_mode = "published"
-        st.sidebar.caption(f"Опубликовано: {snap.get('published_at', '—')}")
+        st.session_state["source_mode"] = source_mode
+        st.session_state["published_at"] = snap.get("published_at", "—")
+        st.sidebar.caption(f"Опубликовано: {st.session_state['published_at']}")
     elif snap is not None:
         st.warning("Снимок старого формата. Загрузите файлы и опубликуйте заново.")
         st.stop()
+
+if base_dz is None:
+    st.info("Нет данных. Администратор: пароль → дз.xlsx + до.xlsx → «Опубликовать».")
+    st.stop()
+
 
 if base_dz is None:
     st.info(
@@ -972,15 +992,7 @@ dz_f, unissued_f = apply_filters(base_dz, base_unissued, selected_clients, selec
 summary_f = build_summary(dz_f, unissued_f)
 metrics = metrics_from_summary(summary_f)
 
-if dz_f is None or dz_f.empty:
-    plan_df = pd.DataFrame()
-else:
-    cols_need = [c for c in ["Контрагент", "Остаток", "Просрочено", "Дата оплаты по договору"] if c in dz_f.columns]
-    slim = dz_f[cols_need].copy()
-    if "Дата оплаты по договору" in slim.columns:
-        slim["Дата оплаты по договору"] = slim["Дата оплаты по договору"].astype(str)
-    payload = slim.to_json(orient="records", force_ascii=False)
-    plan_df = _build_payment_plan_cached(len(slim), payload)
+plan_df = build_payment_plan(dz_f) if dz_f is not None and not dz_f.empty else pd.DataFrame()
 
 st.sidebar.caption(
     f"Строк ДЗ: {len(dz_f):,} · заявок ДО: {len(unissued_f):,}".replace(",", " ")
@@ -999,7 +1011,7 @@ if is_admin and source_mode == "live":
                 st.success(msg)
                 st.balloons()
                 _load_published_snapshot_cached.clear()
-                _frames_from_snapshot_cached.clear()
+                st.session_state.pop("base_dz", None); st.session_state.pop("base_unissued", None); st.session_state.pop("_data_key", None)
             else:
                 st.error(msg)
 
