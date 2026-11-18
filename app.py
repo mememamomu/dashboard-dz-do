@@ -138,7 +138,109 @@ def _dt_str(v):
         return None
 
 
+def isocal_week_label(dt):
+    if pd.isna(dt):
+        return None
+    iso = pd.Timestamp(dt).isocalendar()
+    return f"{int(iso.year)}-W{int(iso.week):02d}"
+
+
+def current_iso_week_label():
+    today = pd.Timestamp.now().normalize()
+    iso = today.isocalendar()
+    return f"{int(iso.year)}-W{int(iso.week):02d}"
+
+
+def exclude_client_from_unissued(name: str) -> bool:
+    s = str(name or "")
+    s_low = s.lower().replace("«", '"').replace("»", '"').replace("“", '"').replace("”", '"')
+    if re.search(r"(^|[\s\"'])ип([\s\"'\.]|$)", s_low):
+        return True
+    if "взлет" in s_low or "взлёт" in s_low:
+        return True
+    return False
+
+
+def ensure_dz_categories(df: pd.DataFrame) -> pd.DataFrame:
+    """Гарантирует наличие расчётных колонок (важно для старых снимков)."""
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+
+    df = df.copy()
+    if "Сумма счета" not in df.columns:
+        df["Сумма счета"] = 0.0
+    if "Оплачено" not in df.columns:
+        df["Оплачено"] = 0.0
+    if "Просрочка, дни" not in df.columns:
+        df["Просрочка, дни"] = 0.0
+
+    for c in ("Сумма счета", "Оплачено", "Просрочка, дни"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    if "Остаток" not in df.columns:
+        df["Остаток"] = (df["Сумма счета"] - df["Оплачено"]).clip(lower=0)
+    else:
+        df["Остаток"] = pd.to_numeric(df["Остаток"], errors="coerce").fillna(0)
+
+    if "Дата оплаты по договору" in df.columns:
+        df["Дата оплаты по договору"] = pd.to_datetime(df["Дата оплаты по договору"], errors="coerce")
+    else:
+        df["Дата оплаты по договору"] = pd.NaT
+
+    if "Дата отправления" in df.columns:
+        df["Дата отправления"] = pd.to_datetime(df["Дата отправления"], errors="coerce")
+    else:
+        df["Дата отправления"] = pd.NaT
+
+    is_overdue = df["Просрочка, дни"] < 0
+    has_underpay = df["Остаток"] > 0
+    has_pdo = df["Дата оплаты по договору"].notna()
+    no_sent = df["Дата отправления"].isna()
+
+    df["Просрочено"] = df["Остаток"].where(is_overdue & has_underpay, 0)
+    df["Есть в ДЗ"] = df["Остаток"].where(has_pdo & (df["Просрочка, дни"] >= 0), 0)
+    df["Нет ПДО"] = df["Сумма счета"].where(no_sent, 0)
+    df["Не отправлено"] = df["Остаток"].where(no_sent, 0)
+
+    cur_week = current_iso_week_label()
+    week_labels = df["Дата оплаты по договору"].map(isocal_week_label)
+    due_this_week = (week_labels == cur_week) & (df["Остаток"] > 0)
+    df["Подходит к оплате"] = df["Остаток"].where(due_this_week | (is_overdue & has_underpay), 0)
+
+    return df
+
+
+def ensure_unissued_categories(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    df = df.copy()
+    if "Сумма" not in df.columns:
+        df["Сумма"] = 0.0
+    df["Сумма"] = pd.to_numeric(df["Сумма"], errors="coerce").fillna(0)
+
+    if "Номер счета" not in df.columns:
+        df["Номер счета"] = ""
+    inv = df["Номер счета"].astype(str).str.strip()
+    no_invoice = inv.isna() | (inv == "") | (inv.str.lower() == "nan") | (inv.str.lower() == "none")
+
+    if "Дата оплаты клиента" in df.columns:
+        df["Дата оплаты клиента"] = pd.to_datetime(df["Дата оплаты клиента"], errors="coerce")
+    else:
+        df["Дата оплаты клиента"] = pd.NaT
+    no_client_pay = df["Дата оплаты клиента"].isna()
+
+    if "Контрагент" not in df.columns:
+        df["Контрагент"] = ""
+    excluded = df["Контрагент"].map(exclude_client_from_unissued)
+
+    df["Не отправлено"] = df["Сумма"].where(no_invoice, 0)
+    df["Не выставлено"] = df["Сумма"].where(no_invoice & no_client_pay & ~excluded, 0)
+    return df
+
+
 def snapshot_from_frames(dz: pd.DataFrame, unissued: pd.DataFrame) -> dict:
+    dz = ensure_dz_categories(dz)
+    unissued = ensure_unissued_categories(unissued)
     dz_cols = [
         "Контрагент", "Плательщик", "Заявка", "Номер счета",
         "Дата счета", "Дата оплаты по договору", "Просрочка, дни",
@@ -153,8 +255,10 @@ def snapshot_from_frames(dz: pd.DataFrame, unissued: pd.DataFrame) -> dict:
     for c in dz_out.select_dtypes(include="float").columns:
         dz_out[c] = dz_out[c].round(2)
 
-    un_cols = ["Контрагент", "Заявка", "Сумма", "Дата загрузки", "Дата заявки",
-               "Дата оплаты клиента", "Бухгалтер", "Не выставлено", "Не отправлено"]
+    un_cols = [
+        "Контрагент", "Заявка", "Сумма", "Дата загрузки", "Дата заявки",
+        "Дата оплаты клиента", "Бухгалтер", "Не выставлено", "Не отправлено", "Номер счета",
+    ]
     un_out = unissued[[c for c in un_cols if c in unissued.columns]].copy()
     for c in ("Дата загрузки", "Дата заявки", "Дата оплаты клиента"):
         if c in un_out.columns:
@@ -176,19 +280,17 @@ def frames_from_snapshot(snap: dict):
     for c in ("Дата счета", "Дата оплаты по договору", "Дата отправления"):
         if c in dz.columns:
             dz[c] = pd.to_datetime(dz[c], errors="coerce")
-    num_dz = [
-        "Сумма счета", "Оплачено", "Остаток", "Просрочка, дни",
-        "Просрочено", "Есть в ДЗ", "Подходит к оплате", "Не отправлено", "Нет ПДО",
-    ]
-    for c in num_dz:
+    for c in ("Сумма счета", "Оплачено", "Остаток", "Просрочка, дни"):
         if c in dz.columns:
             dz[c] = pd.to_numeric(dz[c], errors="coerce").fillna(0)
     for c in ("Дата загрузки", "Дата заявки", "Дата оплаты клиента"):
         if c in unissued.columns:
             unissued[c] = pd.to_datetime(unissued[c], errors="coerce")
-    for c in ("Сумма", "Не выставлено", "Не отправлено"):
-        if c in unissued.columns:
-            unissued[c] = pd.to_numeric(unissued[c], errors="coerce").fillna(0)
+    if "Сумма" in unissued.columns:
+        unissued["Сумма"] = pd.to_numeric(unissued["Сумма"], errors="coerce").fillna(0)
+    # Пересчёт категорий — работает и со старыми снимками
+    dz = ensure_dz_categories(dz)
+    unissued = ensure_unissued_categories(unissued)
     return dz, unissued
 
 
@@ -248,33 +350,6 @@ def rub(value):
         return "—"
 
 
-def exclude_client_from_unissued(name: str) -> bool:
-    """Исключить из «Не выставлено»: ООО \"Взлет\" и любые ИП."""
-    s = str(name or "")
-    s_low = s.lower().replace("«", '"').replace("»", '"').replace("“", '"').replace("”", '"')
-    if "ип" in s_low and re.search(r"(^|[\s\"\'«])ип([\s\"\'»\.]|$)", s_low):
-        return True
-    if "взлет" in s_low or "взлёт" in s_low:
-        return True
-    return False
-
-
-def isocal_week_label(dt):
-    if pd.isna(dt):
-        return None
-    iso = pd.Timestamp(dt).isocalendar()
-    return f"{int(iso.year)}-W{int(iso.week):02d}"
-
-
-def current_iso_week_label():
-    today = pd.Timestamp.now().normalize()
-    iso = today.isocalendar()
-    return f"{int(iso.year)}-W{int(iso.week):02d}"
-
-
-# ---------------------------------------------------------------------------
-# Построение ДЗ с новыми категориями
-# ---------------------------------------------------------------------------
 def build_dz(raw):
     c_payer = find_col(raw, "Плательщик")
     c_client = find_col(raw, "Заявка.Контрагент", "Контрагент")
@@ -309,7 +384,6 @@ def build_dz(raw):
         "Дата отправления": to_date(raw[c_sent]) if c_sent else pd.NaT,
         "Исходный документ": invoice_text.astype(str),
     })
-
     df = df[
         (df["Контрагент"] != "")
         & (df["Контрагент"].str.lower() != "nan")
@@ -317,40 +391,10 @@ def build_dz(raw):
         & (df["Контрагент"].str.lower() != "итого")
         & (df["Сумма счета"] != 0)
     ].copy()
-
-    # Остаток / недоплата
-    df["Остаток"] = (df["Сумма счета"] - df["Оплачено"]).clip(lower=0)
-
-    # Просрочено: дни просрочки < 0 и есть недоплата (оплачено = 0/пусто или < суммы счёта)
-    # (по формулировке заказчика)
-    is_overdue = df["Просрочка, дни"] < 0
-    has_underpay = df["Остаток"] > 0
-    df["Просрочено"] = df["Остаток"].where(is_overdue & has_underpay, 0)
-
-    # Есть в ДЗ: есть ПДО (дата оплаты по договору) и дни просрочки >= 0
-    has_pdo = df["Дата оплаты по договору"].notna()
-    df["Есть в ДЗ"] = df["Остаток"].where(has_pdo & (df["Просрочка, дни"] >= 0), 0)
-
-    # Нет ПДО / нет даты отправки: нет Дата отправления
-    no_sent = df["Дата отправления"].isna()
-    df["Нет ПДО"] = df["Сумма счета"].where(no_sent, 0)
-
-    # Не отправлено (часть из ДЗ): есть счёт, нет даты отправки → остаток/сумма
-    df["Не отправлено"] = df["Остаток"].where(no_sent, 0)
-
-    # Подходит к оплате (часть из ДЗ):
-    # 1) оплата на текущую ISO-неделю (по дате оплаты по договору)
-    # 2) плюс всё, что в «Просрочено»
-    cur_week = current_iso_week_label()
-    week_labels = df["Дата оплаты по договору"].map(isocal_week_label)
-    due_this_week = (week_labels == cur_week) & (df["Остаток"] > 0)
-    df["Подходит к оплате"] = df["Остаток"].where(due_this_week | (is_overdue & has_underpay), 0)
-
-    return df
+    return ensure_dz_categories(df)
 
 
 def build_unissued(raw_do):
-    """Заявки ДО. Поля для «Не выставлено» и части «Не отправлено»."""
     c_client = find_col(raw_do, "Клиент")
     c_request = find_col(raw_do, "Заявка")
     c_invoice = find_col(raw_do, "Номер счета", "Номер счёта")
@@ -367,13 +411,6 @@ def build_unissued(raw_do):
     invoice = raw_do[c_invoice].astype(str).str.strip() if c_invoice else pd.Series([""] * len(raw_do))
     paid_date = to_date(raw_do[c_paid_date]) if c_paid_date else pd.Series(pd.NaT, index=raw_do.index)
 
-    no_invoice = (
-        invoice.isna()
-        | (invoice == "")
-        | (invoice.str.lower() == "nan")
-        | (invoice.str.lower() == "none")
-    )
-
     df = pd.DataFrame({
         "Контрагент": raw_do[c_client].astype(str).str.strip(),
         "Заявка": raw_do[c_request] if c_request else "",
@@ -383,52 +420,57 @@ def build_unissued(raw_do):
         "Дата заявки": to_date(raw_do[c_date]) if c_date else pd.NaT,
         "Дата оплаты клиента": paid_date,
         "Бухгалтер": raw_do[c_manager].astype(str).str.strip() if c_manager else "",
-        "_no_invoice": no_invoice,
     })
-
     df = df[
         (df["Контрагент"] != "")
         & (df["Контрагент"].str.lower() != "nan")
         & (df["Сумма"] != 0)
     ].copy()
-
-    # Не отправлено (из ДО): заявки без счёта
-    df["Не отправлено"] = df["Сумма"].where(df["_no_invoice"], 0)
-
-    # Не выставлено: нет счёта, нет даты оплаты клиента; исключить ИП и ООО Взлет
-    no_client_pay = df["Дата оплаты клиента"].isna()
-    excluded = df["Контрагент"].map(exclude_client_from_unissued)
-    df["Не выставлено"] = df["Сумма"].where(df["_no_invoice"] & no_client_pay & ~excluded, 0)
-
-    return df.drop(columns=["_no_invoice"])
+    return ensure_unissued_categories(df)
 
 
 def build_summary(dz, unissued):
-    """Сводка по контрагентам с новыми показателями."""
+    dz = ensure_dz_categories(dz) if dz is not None else pd.DataFrame()
+    unissued = ensure_unissued_categories(unissued) if unissued is not None else pd.DataFrame()
+
     if dz is None or dz.empty:
         issued = pd.DataFrame(columns=[
             "Контрагент", "Выставлено", "Оплачено", "Неоплачено", "Просрочено",
             "Есть в ДЗ", "Подходит к оплате", "Не отправлено_ДЗ", "Нет ПДО",
         ])
     else:
-        issued = dz.groupby("Контрагент", as_index=False).agg(
-            Выставлено=("Сумма счета", "sum"),
-            Оплачено=("Оплачено", "sum"),
-            Неоплачено=("Остаток", "sum"),
-            Просрочено=("Просрочено", "sum"),
-            **{"Есть в ДЗ": ("Есть в ДЗ", "sum")},
-            **{"Подходит к оплате": ("Подходит к оплате", "sum")},
-            **{"Не отправлено_ДЗ": ("Не отправлено", "sum")},
-            **{"Нет ПДО": ("Нет ПДО", "sum")},
-        )
+        # Только существующие колонки — защита от KeyError
+        agg_map = {}
+        wanted = {
+            "Выставлено": "Сумма счета",
+            "Оплачено": "Оплачено",
+            "Неоплачено": "Остаток",
+            "Просрочено": "Просрочено",
+            "Есть в ДЗ": "Есть в ДЗ",
+            "Подходит к оплате": "Подходит к оплате",
+            "Не отправлено_ДЗ": "Не отправлено",
+            "Нет ПДО": "Нет ПДО",
+        }
+        for out_name, col in wanted.items():
+            if col in dz.columns:
+                agg_map[out_name] = (col, "sum")
+        if "Контрагент" not in dz.columns:
+            issued = pd.DataFrame(columns=list(wanted.keys()) + ["Контрагент"])
+        else:
+            issued = dz.groupby("Контрагент", as_index=False).agg(**agg_map)
 
     if unissued is None or unissued.empty:
         from_do = pd.DataFrame(columns=["Контрагент", "Не выставлено", "Не отправлено_ДО"])
     else:
-        from_do = unissued.groupby("Контрагент", as_index=False).agg(
-            **{"Не выставлено": ("Не выставлено", "sum")},
-            **{"Не отправлено_ДО": ("Не отправлено", "sum")},
-        )
+        agg_do = {}
+        if "Не выставлено" in unissued.columns:
+            agg_do["Не выставлено"] = ("Не выставлено", "sum")
+        if "Не отправлено" in unissued.columns:
+            agg_do["Не отправлено_ДО"] = ("Не отправлено", "sum")
+        if agg_do and "Контрагент" in unissued.columns:
+            from_do = unissued.groupby("Контрагент", as_index=False).agg(**agg_do)
+        else:
+            from_do = pd.DataFrame(columns=["Контрагент", "Не выставлено", "Не отправлено_ДО"])
 
     summary = issued.merge(from_do, on="Контрагент", how="outer").fillna(0)
 
@@ -440,50 +482,27 @@ def build_summary(dz, unissued):
             summary[c] = 0.0
         summary[c] = pd.to_numeric(summary[c], errors="coerce").fillna(0)
 
-    # Не отправлено = без счёта (ДО) + есть счёт, но нет даты отправки (ДЗ)
     summary["Не отправлено"] = summary["Не отправлено_ДЗ"] + summary["Не отправлено_ДО"]
-
-    # Оборот = Выставлено + Не выставлено
     summary["Оборот"] = summary["Выставлено"] + summary["Не выставлено"]
-    # Общая сумма задолженности = Оборот - Выставлено (= Не выставлено)
     summary["Задолженность"] = summary["Оборот"] - summary["Выставлено"]
 
     cols = [
-        "Контрагент",
-        "Оборот",
-        "Выставлено",
-        "Оплачено",
-        "Неоплачено",
-        "Просрочено",
-        "Есть в ДЗ",
-        "Подходит к оплате",
-        "Не отправлено",
-        "Нет ПДО",
-        "Не выставлено",
-        "Задолженность",
+        "Контрагент", "Оборот", "Выставлено", "Оплачено", "Неоплачено", "Просрочено",
+        "Есть в ДЗ", "Подходит к оплате", "Не отправлено", "Нет ПДО", "Не выставлено", "Задолженность",
     ]
     summary = summary[cols]
     return summary.sort_values("Оборот", ascending=False).reset_index(drop=True)
 
 
 def build_payment_plan(dz):
-    """
-    План оплат по неделям.
-    + столбец «Просрочка» (просроченные суммы по клиенту)
-    + строка ИТОГО сверху
-    """
+    dz = ensure_dz_categories(dz) if dz is not None else pd.DataFrame()
     if dz is None or dz.empty:
         return pd.DataFrame()
 
-    # Просрочка по клиенту
-    overdue = (
-        dz.groupby("Контрагент", as_index=True)["Просрочено"].sum()
-        .rename("Просрочка")
-    )
+    overdue = dz.groupby("Контрагент", as_index=True)["Просрочено"].sum().rename("Просрочка")
 
     plan = dz[(dz["Остаток"] > 0) & dz["Дата оплаты по договору"].notna()].copy()
     if plan.empty:
-        # только просрочка
         if overdue.sum() == 0:
             return pd.DataFrame()
         result = overdue.to_frame()
@@ -499,12 +518,9 @@ def build_payment_plan(dz):
     )
     week_cols = sorted([c for c in pivot.columns if c is not None])
     pivot = pivot[week_cols]
-
-    # Просрочка
     pivot = pivot.join(overdue, how="left")
     pivot["Просрочка"] = pivot["Просрочка"].fillna(0)
 
-    # Клиенты только с просрочкой, без недель — тоже показать
     only_overdue = overdue[~overdue.index.isin(pivot.index)]
     only_overdue = only_overdue[only_overdue > 0]
     if not only_overdue.empty:
@@ -512,17 +528,13 @@ def build_payment_plan(dz):
         extra["Просрочка"] = only_overdue
         pivot = pd.concat([pivot, extra])
 
-    # Порядок столбцов: Просрочка, затем недели, Итого по неделям
     pivot["Итого"] = pivot[week_cols].sum(axis=1) if week_cols else 0
     ordered = ["Просрочка"] + week_cols + ["Итого"]
-    pivot = pivot[ordered]
-    pivot = pivot.sort_values("Итого", ascending=False)
+    pivot = pivot[ordered].sort_values("Итого", ascending=False)
 
-    # Строка ИТОГО
     total_row = pivot.sum(axis=0).to_frame().T
     total_row.index = ["ИТОГО"]
-    result = pd.concat([total_row, pivot])
-    return result
+    return pd.concat([total_row, pivot])
 
 
 def metrics_from_summary(summary_f):
@@ -546,9 +558,9 @@ def apply_filters(dz, unissued, clients, payers, invoice_range):
     dz_f = dz.copy() if dz is not None else pd.DataFrame()
     un_f = unissued.copy() if unissued is not None else pd.DataFrame()
     if clients:
-        if not dz_f.empty:
+        if not dz_f.empty and "Контрагент" in dz_f.columns:
             dz_f = dz_f[dz_f["Контрагент"].isin(clients)]
-        if not un_f.empty:
+        if not un_f.empty and "Контрагент" in un_f.columns:
             un_f = un_f[un_f["Контрагент"].isin(clients)]
     if payers and not dz_f.empty and "Плательщик" in dz_f.columns:
         dz_f = dz_f[dz_f["Плательщик"].isin(payers)]
@@ -560,9 +572,6 @@ def apply_filters(dz, unissued, clients, payers, invoice_range):
 
 
 def render_kpi(metrics):
-    """Порядок: Оборот → Выставлено → Оплачено → Неоплачено → Просрочено →
-    Есть в ДЗ → Подходит к оплате → Не отправлено → Нет ПДО → Не выставлено
-    (+ Задолженность = Оборот − Выставлено)."""
     order = [
         ("Оборот", "Оборот"),
         ("Выставлено", "Выставлено (Сумма по счету)"),
@@ -576,9 +585,7 @@ def render_kpi(metrics):
         ("Не выставлено", "Не выставлено"),
         ("Задолженность", "Общая сумма задолженности"),
     ]
-    # 4 + 4 + 3
-    rows = [order[0:4], order[4:8], order[8:11]]
-    for row in rows:
+    for row in (order[0:4], order[4:8], order[8:11]):
         cols = st.columns(len(row))
         for col, (key, label) in zip(cols, row):
             col.metric(label, rub(metrics.get(key, 0)))
@@ -608,10 +615,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
 
     with tabs[1]:
         st.subheader("Планирование оплат по неделям")
-        st.caption(
-            "Строка ИТОГО — суммы по всем контрагентам за неделю. "
-            "Столбец «Просрочка» — просроченные остатки (дни просрочки < 0 и есть недоплата)."
-        )
+        st.caption("Строка ИТОГО — суммы по неделям. Столбец «Просрочка» — просроченные остатки.")
         if plan_df is None or plan_df.empty:
             st.info("Нет данных для плана оплат.")
         else:
@@ -706,7 +710,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
             st.info("Нет детализации ДЗ.")
 
         if unissued_f is not None and not unissued_f.empty:
-            st.subheader("Заявки из ДО (в т.ч. невыставленные)")
+            st.subheader("Заявки из ДО")
             st.dataframe(
                 unissued_f.sort_values("Сумма", ascending=False),
                 use_container_width=True, hide_index=True, height=320,
@@ -781,11 +785,15 @@ if base_dz is None:
     )
     st.stop()
 
+# На всякий случай пересчитываем категории
+base_dz = ensure_dz_categories(base_dz)
+base_unissued = ensure_unissued_categories(base_unissued)
+
 with st.sidebar:
     st.divider()
     st.header("Фильтры")
-    all_clients = set(base_dz["Контрагент"].dropna().unique().tolist())
-    if base_unissued is not None and not base_unissued.empty:
+    all_clients = set(base_dz["Контрагент"].dropna().unique().tolist()) if "Контрагент" in base_dz.columns else set()
+    if base_unissued is not None and not base_unissued.empty and "Контрагент" in base_unissued.columns:
         all_clients |= set(base_unissued["Контрагент"].dropna().unique().tolist())
     clients = sorted(all_clients)
     selected_clients = st.multiselect("Контрагент", clients, default=[])
@@ -837,26 +845,17 @@ render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label=lab
 with st.expander("Пояснения к расчётам"):
     st.markdown(
         f"""
-**Порядок показателей**  
-Оборот → Выставлено → Оплачено → Неоплачено → Просрочено → Есть в ДЗ →  
+**Порядок:** Оборот → Выставлено → Оплачено → Неоплачено → Просрочено → Есть в ДЗ →  
 Подходит к оплате → Не отправлено → Нет ПДО → Не выставлено  
-(+ отдельно **Общая сумма задолженности** = Оборот − Выставлено)
+(+ **Общая сумма задолженности** = Оборот − Выставлено)
 
 | Показатель | Правило |
 |---|---|
-| **Выставлено** | «Сумма по счету» из ДЗ |
-| **Оплачено** | «Сумма оплаченная» из ДЗ |
-| **Неоплачено** | max(0, Сумма по счету − Оплачено) |
-| **Просрочено** | дни просрочки **&lt; 0** и есть недоплата (оплачено 0/пусто или меньше суммы счёта) |
-| **Есть в ДЗ** | есть дата оплаты по договору (ПДО) и дни просрочки **≥ 0** (остаток) |
-| **Подходит к оплате** | остаток с ПДО на **текущую неделю** ({current_iso_week_label()}) **+** Просрочено |
-| **Не отправлено** | заявки ДО без номера счёта **+** счета ДЗ без даты отправления |
-| **Нет ПДО** | счета ДЗ без **даты отправления** (сумма счёта) |
-| **Не выставлено** | заявки ДО без счёта и без даты оплаты клиента; **исключены** ИП и ООО «Взлет» |
-| **Оборот** | Выставлено + Не выставлено |
-
-**Планирование оплат**  
-- строка **ИТОГО** сверху — суммы по неделям по всем клиентам  
-- столбец **Просрочка** — просроченные остатки по клиенту  
+| **Просрочено** | дни просрочки **&lt; 0** и есть недоплата |
+| **Есть в ДЗ** | есть ПДО и дни просрочки **≥ 0** (остаток) |
+| **Подходит к оплате** | остаток с оплатой на текущую неделю (**{current_iso_week_label()}**) + Просрочено |
+| **Не отправлено** | ДО без счёта + ДЗ без даты отправления |
+| **Нет ПДО** | ДЗ без даты отправления (сумма счёта) |
+| **Не выставлено** | ДО без счёта и без даты оплаты клиента; исключены ИП и ООО «Взлет» |
         """
     )
