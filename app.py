@@ -584,7 +584,7 @@ def render_kpi(metrics):
         ("Нет ПДО", "Нет ПДО"),
         ("Не выставлено", "Не выставлено"),
     ]
-    for row in (order[0:4], order[4:8], order[8:11]):
+    for row in (order[0:4], order[4:8], order[8:10]):
         cols = st.columns(len(row))
         for col, (key, label) in zip(cols, row):
             col.metric(label, rub(metrics.get(key, 0)))
