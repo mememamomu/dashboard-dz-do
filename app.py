@@ -47,52 +47,61 @@ def _gh_headers():
     }
 
 
+@st.cache_data(ttl=600, show_spinner="Загрузка опубликованных данных…")
+def _load_published_snapshot_cached(repo: str, path: str, branch: str, token: str):
+    """Кэш на 10 минут — фильтры не дергают GitHub повторно."""
+    if not (token and repo):
+        return None
+    api_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    r = requests.get(api_url, headers=headers, timeout=60)
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub API {r.status_code}: {r.text[:400]}")
+    meta = r.json()
+    raw_bytes = None
+    if meta.get("content"):
+        raw_bytes = base64.b64decode(meta["content"])
+    elif meta.get("download_url"):
+        r2 = requests.get(
+            meta["download_url"],
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=180,
+        )
+        if r2.status_code != 200:
+            raise RuntimeError(f"download_url HTTP {r2.status_code}: {r2.text[:300]}")
+        raw_bytes = r2.content
+    elif meta.get("sha"):
+        blob_url = f"https://api.github.com/repos/{repo}/git/blobs/{meta['sha']}"
+        r3 = requests.get(blob_url, headers=headers, timeout=180)
+        if r3.status_code == 200:
+            blob = r3.json()
+            if blob.get("content"):
+                raw_bytes = base64.b64decode(blob["content"])
+    if not raw_bytes:
+        return None
+    try:
+        text = gzip.decompress(raw_bytes).decode("utf-8")
+    except OSError:
+        text = raw_bytes.decode("utf-8")
+    text = text.strip()
+    if not text:
+        return None
+    return json.loads(text)
+
+
 def load_published_snapshot():
     if not PUBLISH_ENABLED:
         return None
-    api_url = (
-        f"https://api.github.com/repos/{GITHUB['repo']}/contents/{GITHUB['path']}"
-        f"?ref={GITHUB['branch']}"
-    )
     try:
-        r = requests.get(api_url, headers=_gh_headers(), timeout=60)
-        if r.status_code == 404:
-            return None
-        if r.status_code != 200:
-            st.warning(f"GitHub API {r.status_code}: {r.text[:400]}")
-            return None
-        meta = r.json()
-        raw_bytes = None
-        if meta.get("content"):
-            raw_bytes = base64.b64decode(meta["content"])
-        elif meta.get("download_url"):
-            r2 = requests.get(
-                meta["download_url"],
-                headers={"Authorization": f"Bearer {GITHUB['token']}"},
-                timeout=180,
-            )
-            if r2.status_code != 200:
-                st.warning(f"download_url HTTP {r2.status_code}: {r2.text[:300]}")
-                return None
-            raw_bytes = r2.content
-        elif meta.get("sha"):
-            blob_url = f"https://api.github.com/repos/{GITHUB['repo']}/git/blobs/{meta['sha']}"
-            r3 = requests.get(blob_url, headers=_gh_headers(), timeout=180)
-            if r3.status_code == 200:
-                blob = r3.json()
-                if blob.get("content"):
-                    raw_bytes = base64.b64decode(blob["content"])
-        if not raw_bytes:
-            st.warning("Опубликованный файл пустой. Опубликуйте данные заново.")
-            return None
-        try:
-            text = gzip.decompress(raw_bytes).decode("utf-8")
-        except OSError:
-            text = raw_bytes.decode("utf-8")
-        text = text.strip()
-        if not text:
-            return None
-        return json.loads(text)
+        return _load_published_snapshot_cached(
+            GITHUB["repo"], GITHUB["path"], GITHUB["branch"], GITHUB["token"]
+        )
     except Exception as e:
         st.warning(f"Не удалось загрузить опубликованные данные: {e}")
         return None
@@ -274,9 +283,11 @@ def snapshot_from_frames(dz: pd.DataFrame, unissued: pd.DataFrame) -> dict:
     }
 
 
-def frames_from_snapshot(snap: dict):
-    dz = pd.DataFrame(snap.get("dz", []))
-    unissued = pd.DataFrame(snap.get("unissued", []))
+@st.cache_data(show_spinner="Подготовка данных…")
+def _frames_from_snapshot_cached(published_at: str, dz_json: str, unissued_json: str):
+    """Кэш разбора снимка — повторные фильтры не парсят JSON заново."""
+    dz = pd.read_json(io.StringIO(dz_json), orient="records") if dz_json else pd.DataFrame()
+    unissued = pd.read_json(io.StringIO(unissued_json), orient="records") if unissued_json else pd.DataFrame()
     for c in ("Дата счета", "Дата оплаты по договору", "Дата отправления"):
         if c in dz.columns:
             dz[c] = pd.to_datetime(dz[c], errors="coerce")
@@ -288,10 +299,16 @@ def frames_from_snapshot(snap: dict):
             unissued[c] = pd.to_datetime(unissued[c], errors="coerce")
     if "Сумма" in unissued.columns:
         unissued["Сумма"] = pd.to_numeric(unissued["Сумма"], errors="coerce").fillna(0)
-    # Пересчёт категорий — работает и со старыми снимками
     dz = ensure_dz_categories(dz)
     unissued = ensure_unissued_categories(unissued)
     return dz, unissued
+
+
+def frames_from_snapshot(snap: dict):
+    published_at = str(snap.get("published_at", ""))
+    dz_json = json.dumps(snap.get("dz", []), ensure_ascii=False)
+    unissued_json = json.dumps(snap.get("unissued", []), ensure_ascii=False)
+    return _frames_from_snapshot_cached(published_at, dz_json, unissued_json)
 
 
 def normalize_xlsx(file_bytes: bytes) -> io.BytesIO:
@@ -430,8 +447,14 @@ def build_unissued(raw_do):
 
 
 def build_summary(dz, unissued):
-    dz = ensure_dz_categories(dz) if dz is not None else pd.DataFrame()
-    unissued = ensure_unissued_categories(unissued) if unissued is not None else pd.DataFrame()
+    if dz is None:
+        dz = pd.DataFrame()
+    elif "Просрочено" not in dz.columns:
+        dz = ensure_dz_categories(dz)
+    if unissued is None:
+        unissued = pd.DataFrame()
+    elif "Не выставлено" not in unissued.columns:
+        unissued = ensure_unissued_categories(unissued)
 
     if dz is None or dz.empty:
         issued = pd.DataFrame(columns=[
@@ -494,10 +517,22 @@ def build_summary(dz, unissued):
     return summary.sort_values("Оборот", ascending=False).reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False)
+def _build_payment_plan_cached(n_rows: int, payload: str):
+    df = pd.read_json(io.StringIO(payload), orient="records")
+    if "Дата оплаты по договору" in df.columns:
+        df["Дата оплаты по договору"] = pd.to_datetime(df["Дата оплаты по договору"], errors="coerce")
+    for c in ("Остаток", "Просрочено"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    return build_payment_plan(df)
+
+
 def build_payment_plan(dz):
-    dz = ensure_dz_categories(dz) if dz is not None else pd.DataFrame()
     if dz is None or dz.empty:
         return pd.DataFrame()
+    if "Просрочено" not in dz.columns or "Остаток" not in dz.columns:
+        dz = ensure_dz_categories(dz)
 
     overdue = dz.groupby("Контрагент", as_index=True)["Просрочено"].sum().rename("Просрочка")
 
@@ -607,8 +642,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
         st.subheader("Сводка в формате «ОБЩАЯ ДЗ»")
         if summary_f is not None and not summary_f.empty:
             show = summary_f.drop(columns=["Задолженность"], errors="ignore")
-            fmt = {c: "{:,.2f}" for c in show.columns if c != "Контрагент"}
-            st.dataframe(show.style.format(fmt), use_container_width=True, hide_index=True, height=520)
+            st.dataframe(show, use_container_width=True, hide_index=True, height=520)
         else:
             st.info("Нет данных.")
 
@@ -699,8 +733,9 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
             )
             st.caption("Фильтр: " + " · ".join(label_parts))
 
+            # без Styler — заметно быстрее на больших таблицах
             st.dataframe(
-                plan_view.style.format("{:,.2f}"),
+                plan_view,
                 use_container_width=True,
                 height=520,
             )
@@ -869,10 +904,7 @@ if base_dz is None:
     )
     st.stop()
 
-# На всякий случай пересчитываем категории
-base_dz = ensure_dz_categories(base_dz)
-base_unissued = ensure_unissued_categories(base_unissued)
-
+# Категории уже посчитаны в frames_from_snapshot / build_*
 with st.sidebar:
     st.divider()
     st.header("Фильтры")
@@ -902,7 +934,16 @@ with st.sidebar:
 dz_f, unissued_f = apply_filters(base_dz, base_unissued, selected_clients, selected_payers, invoice_range)
 summary_f = build_summary(dz_f, unissued_f)
 metrics = metrics_from_summary(summary_f)
-plan_df = build_payment_plan(dz_f)
+
+if dz_f is None or dz_f.empty:
+    plan_df = pd.DataFrame()
+else:
+    cols_need = [c for c in ["Контрагент", "Остаток", "Просрочено", "Дата оплаты по договору"] if c in dz_f.columns]
+    slim = dz_f[cols_need].copy()
+    if "Дата оплаты по договору" in slim.columns:
+        slim["Дата оплаты по договору"] = slim["Дата оплаты по договору"].astype(str)
+    payload = slim.to_json(orient="records", force_ascii=False)
+    plan_df = _build_payment_plan_cached(len(slim), payload)
 
 st.sidebar.caption(
     f"Строк ДЗ: {len(dz_f):,} · заявок ДО: {len(unissued_f):,}".replace(",", " ")
@@ -920,6 +961,8 @@ if is_admin and source_mode == "live":
             if ok:
                 st.success(msg)
                 st.balloons()
+                _load_published_snapshot_cached.clear()
+                _frames_from_snapshot_cached.clear()
             else:
                 st.error(msg)
 
@@ -930,8 +973,7 @@ with st.expander("Пояснения к расчётам"):
     st.markdown(
         f"""
 **Порядок:** Оборот → Выставлено → Оплачено → Неоплачено → Просрочено → Есть в ДЗ →  
-Подходит к оплате → Не отправлено → Нет ПДО → Не выставлено  
-(+ **Общая сумма задолженности** = Оборот − Выставлено)
+Подходит к оплате → Не отправлено → Нет ПДО → Не выставлено
 
 | Показатель | Правило |
 |---|---|
