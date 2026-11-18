@@ -614,11 +614,96 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
 
     with tabs[1]:
         st.subheader("Планирование оплат по неделям")
-        st.caption("Строка ИТОГО — суммы по неделям. Столбец «Просрочка» — просроченные остатки.")
+        st.caption(
+            "Строка ИТОГО — суммы по неделям. Столбец «Просрочка» — просроченные остатки. "
+            "Фильтры ниже работают только в этом разделе."
+        )
+
         if plan_df is None or plan_df.empty:
             st.info("Нет данных для плана оплат.")
         else:
-            st.dataframe(plan_df.style.format("{:,.2f}"), use_container_width=True, height=520)
+            plan_view = plan_df.copy()
+
+            # Контрагенты без строки ИТОГО
+            client_index = [i for i in plan_view.index if str(i) != "ИТОГО"]
+            # Столбцы недель вида 2026-W15
+            week_cols = [
+                c for c in plan_view.columns
+                if c not in ("Просрочка", "Итого") and str(c).startswith("20")
+            ]
+
+            f1, f2 = st.columns(2)
+            with f1:
+                sel_clients = st.multiselect(
+                    "Контрагент",
+                    options=client_index,
+                    default=[],
+                    key="plan_clients",
+                )
+            with f2:
+                sel_weeks = st.multiselect(
+                    "Неделя",
+                    options=week_cols,
+                    default=[],
+                    key="plan_weeks",
+                )
+
+            # Фильтр по контрагентам + пересчёт ИТОГО
+            if sel_clients:
+                body = plan_view.loc[[i for i in plan_view.index if i in sel_clients]]
+                if not body.empty:
+                    total = body.sum(axis=0).to_frame().T
+                    total.index = ["ИТОГО"]
+                    plan_view = pd.concat([total, body])
+                else:
+                    plan_view = plan_view.iloc[0:0]
+
+            # Какие недели показывать
+            base_cols = [c for c in ["Просрочка"] if c in plan_view.columns]
+            if sel_weeks:
+                show_weeks = [w for w in sel_weeks if w in plan_view.columns]
+            else:
+                show_weeks = [
+                    c for c in plan_view.columns
+                    if c not in ("Просрочка", "Итого")
+                ]
+
+            # Итого = сумма только по выбранным неделям
+            plan_view = plan_view.copy()
+            if show_weeks:
+                plan_view["Итого"] = plan_view[show_weeks].sum(axis=1)
+            tail = [c for c in ["Итого"] if c in plan_view.columns]
+            cols_show = base_cols + show_weeks + tail
+            cols_show = [c for c in cols_show if c in plan_view.columns]
+            plan_view = plan_view[cols_show]
+
+            # Сумма к оплате по выбранным параметрам (без «Просрочка»)
+            body_rows = [i for i in plan_view.index if str(i) != "ИТОГО"]
+            body = plan_view.loc[body_rows] if body_rows else plan_view.iloc[0:0]
+            week_cols_show = [c for c in body.columns if c not in ("Просрочка", "Итого")]
+            extra_sum = float(body[week_cols_show].sum().sum()) if (not body.empty and week_cols_show) else 0.0
+
+            label_parts = []
+            if sel_clients:
+                label_parts.append(f"контрагентов: {len(sel_clients)}")
+            else:
+                label_parts.append("все контрагенты")
+            if sel_weeks:
+                label_parts.append("недели: " + ", ".join(sel_weeks))
+            else:
+                label_parts.append("все недели")
+
+            st.metric(
+                "Сумма к оплате по выбранным параметрам",
+                f"{extra_sum:,.2f} ₽".replace(",", " ").replace(".", ","),
+            )
+            st.caption("Фильтр: " + " · ".join(label_parts))
+
+            st.dataframe(
+                plan_view.style.format("{:,.2f}"),
+                use_container_width=True,
+                height=520,
+            )
 
     with tabs[2]:
         left, right = st.columns(2)
