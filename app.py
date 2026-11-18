@@ -361,10 +361,35 @@ def number(series):
 
 
 def rub(value):
+    """4 000 000,00 ₽"""
     try:
         return f"{float(value):,.2f} ₽".replace(",", " ").replace(".", ",")
     except Exception:
         return "—"
+
+
+def fmt_num(value):
+    """4 000 000,00 без валюты — для таблиц."""
+    try:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return ""
+        return f"{float(value):,.2f}".replace(",", " ").replace(".", ",")
+    except Exception:
+        return ""
+
+
+def format_money_df(df: pd.DataFrame, exclude=None) -> pd.DataFrame:
+    """Копия таблицы с суммами в виде 4 000 000,00 (строки). Быстрее Styler."""
+    if df is None or df.empty:
+        return df
+    exclude = set(exclude or [])
+    out = df.copy()
+    for c in out.columns:
+        if c in exclude:
+            continue
+        if pd.api.types.is_numeric_dtype(out[c]):
+            out[c] = out[c].map(fmt_num)
+    return out
 
 
 def build_dz(raw):
@@ -642,7 +667,10 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
         st.subheader("Сводка в формате «ОБЩАЯ ДЗ»")
         if summary_f is not None and not summary_f.empty:
             show = summary_f.drop(columns=["Задолженность"], errors="ignore")
-            st.dataframe(show, use_container_width=True, hide_index=True, height=520)
+            st.dataframe(
+                format_money_df(show, exclude={"Контрагент"}),
+                use_container_width=True, hide_index=True, height=520,
+            )
         else:
             st.info("Нет данных.")
 
@@ -733,9 +761,8 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
             )
             st.caption("Фильтр: " + " · ".join(label_parts))
 
-            # без Styler — заметно быстрее на больших таблицах
             st.dataframe(
-                plan_view,
+                format_money_df(plan_view),
                 use_container_width=True,
                 height=520,
             )
@@ -824,14 +851,24 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
             sort_cols = [c for c in ["Дата счета", "Контрагент"] if c in view.columns]
             if sort_cols:
                 view = view.sort_values(sort_cols, ascending=[False] + [True] * (len(sort_cols) - 1))
-            st.dataframe(view[cols], use_container_width=True, hide_index=True, height=420)
+            money_cols = {
+                "Сумма счета", "Оплачено", "Остаток", "Просрочено", "Есть в ДЗ",
+                "Подходит к оплате", "Не отправлено", "Нет ПДО", "Сумма",
+            }
+            view_show = view[cols].copy()
+            for c in view_show.columns:
+                if c in money_cols and c in view_show.columns:
+                    view_show[c] = pd.to_numeric(view_show[c], errors="coerce").map(fmt_num)
+            st.dataframe(view_show, use_container_width=True, hide_index=True, height=420)
         else:
             st.info("Нет детализации ДЗ.")
 
         if unissued_f is not None and not unissued_f.empty:
             st.subheader("Заявки из ДО")
+            u = unissued_f.sort_values("Сумма", ascending=False)
             st.dataframe(
-                unissued_f.sort_values("Сумма", ascending=False),
+                format_money_df(u, exclude={"Контрагент", "Заявка", "Номер счета", "Бухгалтер",
+                                           "Дата загрузки", "Дата заявки", "Дата оплаты клиента"}),
                 use_container_width=True, hide_index=True, height=320,
             )
 
