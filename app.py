@@ -683,7 +683,7 @@ def frames_from_snapshot(snap: dict):
     for c in ("Дата загрузки", "Дата выгрузки", "Дата оплаты клиента",
               "Дата оплаты по договору", "Дата отправки", "Дата доставки", "Дата прихода"):
         if c in do_full.columns:
-            do_full[c] = pd.to_datetime(do_full[c], errors="coerce", dayfirst=True)
+            do_full[c] = pd.to_datetime(do_full[c], errors="coerce")
     if "Ставка заказчика" in do_full.columns:
         do_full["Ставка заказчика"] = pd.to_numeric(do_full["Ставка заказчика"], errors="coerce").fillna(0)
     if not do_full.empty:
@@ -892,11 +892,25 @@ def build_summary(dz, unissued):
             "Нет ПДО": "Нет ПДО",
             "Нет в ПДЗ": "Нет в ПДЗ",
         }
-        agg_map = {out: (col, "sum") for out, col in wanted.items() if col in dz.columns}
-        if "Контрагент" not in dz.columns or not agg_map:
+        # гарантируем наличие колонок до agg
+        for _src in set(wanted.values()):
+            if _src not in dz.columns:
+                dz[_src] = 0.0
+        agg_map = {out: (col, "sum") for out, col in wanted.items()}
+        if "Контрагент" not in dz.columns:
             issued = pd.DataFrame(columns=["Контрагент"] + list(wanted.keys()))
         else:
-            issued = dz.groupby("Контрагент", as_index=False).agg(**agg_map)
+            try:
+                issued = dz.groupby("Контрагент", as_index=False).agg(**agg_map)
+            except Exception:
+                # запасной путь — без named agg
+                tmp = dz.copy()
+                issued = tmp.groupby("Контрагент", as_index=False)[list(set(wanted.values()))].sum()
+                rename = {v: k for k, v in wanted.items()}
+                issued = issued.rename(columns=rename)
+                for k in wanted:
+                    if k not in issued.columns:
+                        issued[k] = 0.0
 
     if unissued is None or unissued.empty:
         from_do = pd.DataFrame(columns=["Контрагент", "Не выставлено", "Не отправлено_ДО"])
@@ -1133,7 +1147,7 @@ def render_plan_tab(plan_df):
         + " · "
         + ("недели: " + ", ".join(sel_weeks) if sel_weeks else "все недели")
     )
-    st.dataframe(format_money_df(view), use_container_width=True, height=520)
+    st.dataframe(format_money_df(view), width="stretch", height=520)
 
 
 
@@ -1158,7 +1172,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
             show = summary_f.drop(columns=["Задолженность"], errors="ignore")
             st.dataframe(
                 format_money_df(show, exclude={"Контрагент"}),
-                use_container_width=True, hide_index=True, height=520,
+                width="stretch", hide_index=True, height=520,
             )
         else:
             st.info("Нет данных.")
@@ -1176,7 +1190,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
             st.info("Нет невыставленных заявок по заданным условиям.")
         else:
             st.dataframe(format_money_df(not_inv_sum, exclude={"Клиент", "Ответственный сотрудник ДО"}),
-                         use_container_width=True, hide_index=True, height=360)
+                         width="stretch", hide_index=True, height=360)
         st.markdown("**Детализация невыставленных заявок**")
         if not_inv_det is None or not_inv_det.empty:
             st.info("Нет строк детализации.")
@@ -1184,7 +1198,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
             st.dataframe(format_money_df(not_inv_det, exclude={
                 "Номер заявки", "Заказчик/клиент", "Дата погрузки/загрузки", "Дата выгрузки",
                 "Номер счета", "Ответственный сотрудник ДО", "Месяц",
-            }), use_container_width=True, hide_index=True, height=360)
+            }), width="stretch", hide_index=True, height=360)
 
     with tabs[3]:
         st.subheader("Неотправленные заявки")
@@ -1196,7 +1210,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
             st.info("Нет неотправленных заявок по заданным условиям.")
         else:
             st.dataframe(format_money_df(not_sent_sum, exclude={"Клиент", "Ответственный сотрудник ДО"}),
-                         use_container_width=True, hide_index=True, height=360)
+                         width="stretch", hide_index=True, height=360)
         st.markdown("**Детализация неотправленных заявок**")
         if not_sent_det is None or not_sent_det.empty:
             st.info("Нет строк детализации.")
@@ -1204,7 +1218,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
             st.dataframe(format_money_df(not_sent_det, exclude={
                 "Номер заявки", "Заказчик/клиент", "Дата погрузки/загрузки", "Дата выгрузки",
                 "Номер счета", "Дата прихода", "Ответственный сотрудник ДО", "Месяц",
-            }), use_container_width=True, hide_index=True, height=360)
+            }), width="stretch", hide_index=True, height=360)
 
     with tabs[4]:
         st.subheader("Топ контрагентов по обороту")
@@ -1220,7 +1234,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
                     title="Топ-15 по обороту",
                     labels={"Оборот": "Оборот, ₽"},
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
         else:
             st.info("Нет данных для топа по обороту.")
 
@@ -1240,7 +1254,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
                 title="Суммы: выставлено / оплачено / просрочено",
                 labels={"value": "Сумма, ₽", "variable": "Показатель"},
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         else:
             st.info("Нет дат счетов для помесячной динамики.")
@@ -1253,7 +1267,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
         if deferral_df is None or deferral_df.empty:
             st.info("Недостаточно данных для расчёта отсрочки.")
         else:
-            st.dataframe(deferral_df, use_container_width=True, hide_index=True, height=360)
+            st.dataframe(deferral_df, width="stretch", hide_index=True, height=360)
 
         st.subheader("Распределение фактических сроков оплаты")
         st.caption("По какой отсрочке (в днях) приходится наибольшая масса оплат.")
@@ -1274,7 +1288,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
                 title="Масса фактических сроков оплаты (дни)",
                 hole=0.35,
             )
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width="stretch")
 
     with tabs[5]:
         if dz_f is not None and not dz_f.empty:
@@ -1305,7 +1319,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
             for c in view_show.columns:
                 if c in money_cols and c in view_show.columns:
                     view_show[c] = pd.to_numeric(view_show[c], errors="coerce").map(fmt_num)
-            st.dataframe(view_show, use_container_width=True, hide_index=True, height=420)
+            st.dataframe(view_show, width="stretch", hide_index=True, height=420)
         else:
             st.info("Нет детализации ДЗ.")
 
@@ -1315,7 +1329,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
             st.dataframe(
                 format_money_df(u, exclude={"Контрагент", "Заявка", "Номер счета", "Бухгалтер",
                                            "Дата загрузки", "Дата заявки", "Дата оплаты клиента"}),
-                use_container_width=True, hide_index=True, height=320,
+                width="stretch", hide_index=True, height=320,
             )
 
     with tabs[6]:
