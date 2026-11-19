@@ -204,7 +204,8 @@ def ensure_dz_categories(df: pd.DataFrame) -> pd.DataFrame:
     is_overdue = df["Просрочка, дни"] < 0
     has_underpay = df["Остаток"] > 0
     has_pdo = df["Дата оплаты по договору"].notna()
-    no_sent = df["Дата отправления"].isna()
+    # Счёт считается отправленным, если есть дата отправления ИЛИ уже есть оплата
+    no_sent = df["Дата отправления"].isna() & (df["Оплачено"] <= 0)
 
     df["Просрочено"] = df["Остаток"].where(is_overdue & has_underpay, 0)
     df["Есть в ДЗ"] = df["Остаток"].where(has_pdo & (df["Просрочка, дни"] >= 0), 0)
@@ -243,11 +244,236 @@ def ensure_unissued_categories(df: pd.DataFrame) -> pd.DataFrame:
     excluded = df["Контрагент"].map(exclude_client_from_unissued)
 
     df["Не отправлено"] = df["Сумма"].where(no_invoice, 0)
-    df["Не выставлено"] = df["Сумма"].where(no_invoice & no_client_pay & ~excluded, 0)
+    # Не выставлено: нет счёта, нет оплаты клиента, не ИП/Взлет, сумма > 2
+    df["Не выставлено"] = df["Сумма"].where(no_invoice & no_client_pay & ~excluded & (df["Сумма"] > 2), 0)
     return df
 
 
-def snapshot_from_frames(dz: pd.DataFrame, unissued: pd.DataFrame) -> dict:
+
+def _month_label(dt):
+    if pd.isna(dt):
+        return None
+    ts = pd.Timestamp(dt)
+    return f"{ts.year}-{ts.month:02d}"
+
+
+def prepare_do_full(raw_do: pd.DataFrame) -> pd.DataFrame:
+    """Полная таблица ДО для разделов Невыставленные / Неотправленные."""
+    c_client = find_col(raw_do, "Клиент")
+    c_request = find_col(raw_do, "Заявка")
+    c_invoice = find_col(raw_do, "Номер счета", "Номер счёта")
+    c_amount = find_col(raw_do, "Ставка заказчика")
+    c_load = find_col(raw_do, "Дата загрузки")
+    c_unload = find_col(raw_do, "Дата выгрузки")
+    c_paid_date = find_col(raw_do, "Дата оплаты клиента")
+    c_due = find_col(raw_do, "Дата оплаты по договору")
+    c_sent = find_col(raw_do, "Дата отправки", "Дата отправления")
+    c_delivery = find_col(raw_do, "Дата доставки")
+    c_arrival = find_col(raw_do, "Дата прихода")
+    c_manager = find_col(raw_do, "Клиентский бухгалтер", "Менеджер")
+
+    if c_client is None or c_amount is None:
+        raise ValueError("В файле ДО не найдены «Клиент» и/или «Ставка заказчика».")
+
+    amount = number(raw_do[c_amount])
+    invoice = raw_do[c_invoice].astype(str).str.strip() if c_invoice else pd.Series([""] * len(raw_do))
+    inv_empty = (
+        invoice.isna() | (invoice == "") | (invoice.str.lower() == "nan")
+        | (invoice.str.lower() == "none") | (invoice == "0")
+    )
+
+    df = pd.DataFrame({
+        "Заявка": raw_do[c_request] if c_request else "",
+        "Клиент": raw_do[c_client].astype(str).str.strip(),
+        "Номер счета": invoice.where(~inv_empty, ""),
+        "Ставка заказчика": amount,
+        "Дата загрузки": to_date(raw_do[c_load]) if c_load else pd.NaT,
+        "Дата выгрузки": to_date(raw_do[c_unload]) if c_unload else pd.NaT,
+        "Дата оплаты клиента": to_date(raw_do[c_paid_date]) if c_paid_date else pd.NaT,
+        "Дата оплаты по договору": to_date(raw_do[c_due]) if c_due else pd.NaT,
+        "Дата отправки": to_date(raw_do[c_sent]) if c_sent else pd.NaT,
+        "Дата доставки": to_date(raw_do[c_delivery]) if c_delivery else pd.NaT,
+        "Дата прихода": to_date(raw_do[c_arrival]) if c_arrival else pd.NaT,
+        "Ответственный сотрудник ДО": (
+            raw_do[c_manager].astype(str).str.strip() if c_manager else ""
+        ),
+        "_no_invoice": inv_empty,
+    })
+    df = df[
+        (df["Клиент"] != "")
+        & (df["Клиент"].str.lower() != "nan")
+    ].copy()
+    df["_excluded"] = df["Клиент"].map(exclude_client_from_unissued)
+    df["Месяц"] = df["Дата выгрузки"].map(_month_label)
+    return df
+
+
+def build_not_invoiced_section(do_full: pd.DataFrame):
+    """Невыставленные: ставка > 2, нет счёта, нет оплаты клиента, не ИП/Взлет."""
+    if do_full is None or do_full.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    mask = (
+        (do_full["Ставка заказчика"] > 2)
+        & do_full["_no_invoice"]
+        & do_full["Дата оплаты клиента"].isna()
+        & ~do_full["_excluded"]
+    )
+    detail = do_full.loc[mask, [
+        "Заявка", "Клиент", "Дата загрузки", "Дата выгрузки",
+        "Номер счета", "Ставка заказчика", "Ответственный сотрудник ДО", "Месяц",
+    ]].copy()
+    detail = detail.rename(columns={
+        "Заявка": "Номер заявки",
+        "Клиент": "Заказчик/клиент",
+        "Дата загрузки": "Дата погрузки/загрузки",
+        "Ставка заказчика": "Ставка заказчика",
+    })
+    if detail.empty:
+        return pd.DataFrame(), detail
+
+    pivot_src = do_full.loc[mask].copy()
+    pivot_src = pivot_src[pivot_src["Месяц"].notna()]
+    if pivot_src.empty:
+        summary = (
+            do_full.loc[mask]
+            .groupby(["Клиент", "Ответственный сотрудник ДО"], as_index=False)["Ставка заказчика"]
+            .sum()
+            .rename(columns={"Ставка заказчика": "Итого"})
+        )
+        return summary, detail
+
+    pivot = (
+        pivot_src.groupby(["Клиент", "Ответственный сотрудник ДО", "Месяц"], as_index=False)["Ставка заказчика"]
+        .sum()
+        .pivot_table(
+            index=["Клиент", "Ответственный сотрудник ДО"],
+            columns="Месяц",
+            values="Ставка заказчика",
+            aggfunc="sum",
+            fill_value=0,
+        )
+    )
+    months = sorted(pivot.columns.tolist())
+    pivot = pivot[months]
+    pivot["Итого"] = pivot[months].sum(axis=1)
+    pivot = pivot.sort_values("Итого", ascending=False).reset_index()
+    return pivot, detail
+
+
+def build_not_sent_section(do_full: pd.DataFrame):
+    """
+    Неотправленные заявки (раздел):
+    есть счёт и/или дата прихода оригиналов,
+    но нет даты отправки, даты оплаты по договору и даты оплаты клиента;
+    не ИП / Взлет.
+    """
+    if do_full is None or do_full.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    has_invoice = ~do_full["_no_invoice"]
+    has_arrival = do_full["Дата прихода"].notna()
+    no_sent = do_full["Дата отправки"].isna()
+    no_due = do_full["Дата оплаты по договору"].isna()
+    no_client_pay = do_full["Дата оплаты клиента"].isna()
+    mask = (
+        (has_invoice | has_arrival)
+        & no_sent & no_due & no_client_pay
+        & ~do_full["_excluded"]
+        & (do_full["Ставка заказчика"] != 0)
+    )
+    detail = do_full.loc[mask, [
+        "Заявка", "Клиент", "Дата загрузки", "Дата выгрузки",
+        "Номер счета", "Дата прихода", "Ставка заказчика",
+        "Ответственный сотрудник ДО", "Месяц",
+    ]].copy()
+    detail = detail.rename(columns={
+        "Заявка": "Номер заявки",
+        "Клиент": "Заказчик/клиент",
+        "Дата загрузки": "Дата погрузки/загрузки",
+    })
+    if detail.empty:
+        return pd.DataFrame(), detail
+
+    pivot_src = do_full.loc[mask].copy()
+    pivot_src = pivot_src[pivot_src["Месяц"].notna()]
+    if pivot_src.empty:
+        summary = (
+            do_full.loc[mask]
+            .groupby(["Клиент", "Ответственный сотрудник ДО"], as_index=False)["Ставка заказчика"]
+            .sum()
+            .rename(columns={"Ставка заказчика": "Итого"})
+        )
+        return summary, detail
+
+    pivot = (
+        pivot_src.groupby(["Клиент", "Ответственный сотрудник ДО", "Месяц"], as_index=False)["Ставка заказчика"]
+        .sum()
+        .pivot_table(
+            index=["Клиент", "Ответственный сотрудник ДО"],
+            columns="Месяц",
+            values="Ставка заказчика",
+            aggfunc="sum",
+            fill_value=0,
+        )
+    )
+    months = sorted(pivot.columns.tolist())
+    pivot = pivot[months]
+    pivot["Итого"] = pivot[months].sum(axis=1)
+    pivot = pivot.sort_values("Итого", ascending=False).reset_index()
+    return pivot, detail
+
+
+def build_deferral_analytics(dz: pd.DataFrame, do_full: pd.DataFrame) -> pd.DataFrame:
+    """
+    Средняя отсрочка по договору = Дата оплаты по договору (ДЗ) − Дата выгрузки (ДО)
+    Фактический срок оплаты = Дата оплаты клиента (ДО) − Дата выгрузки (ДО)
+    По номеру заявки, среднее по клиенту (дни).
+    """
+    if dz is None or dz.empty or do_full is None or do_full.empty:
+        return pd.DataFrame()
+
+    dz_part = dz.copy()
+    if "Заявка" not in dz_part.columns or "Дата оплаты по договору" not in dz_part.columns:
+        return pd.DataFrame()
+    dz_part["Заявка"] = dz_part["Заявка"].astype(str).str.strip()
+    dz_due = (
+        dz_part.dropna(subset=["Дата оплаты по договору"])
+        .groupby("Заявка", as_index=False)["Дата оплаты по договору"]
+        .min()
+    )
+
+    do_part = do_full.copy()
+    do_part["Заявка"] = do_part["Заявка"].astype(str).str.strip()
+    do_use = do_part[[
+        "Заявка", "Клиент", "Дата выгрузки", "Дата оплаты клиента"
+    ]].copy()
+
+    merged = do_use.merge(dz_due, on="Заявка", how="left")
+    merged["Отсрочка по договору, дни"] = (
+        merged["Дата оплаты по договору"] - merged["Дата выгрузки"]
+    ).dt.days
+    merged["Фактический срок оплаты, дни"] = (
+        merged["Дата оплаты клиента"] - merged["Дата выгрузки"]
+    ).dt.days
+
+    agg = (
+        merged.groupby("Клиент", as_index=False)
+        .agg(
+            **{
+                "Средняя отсрочка по договору, дни": ("Отсрочка по договору, дни", "mean"),
+                "Фактический срок оплаты, дни": ("Фактический срок оплаты, дни", "mean"),
+                "Заявок": ("Заявка", "count"),
+            }
+        )
+    )
+    for c in ("Средняя отсрочка по договору, дни", "Фактический срок оплаты, дни"):
+        agg[c] = agg[c].round(1)
+    agg["Отклонение, дни"] = (
+        agg["Фактический срок оплаты, дни"] - agg["Средняя отсрочка по договору, дни"]
+    ).round(1)
+    return agg.sort_values("Отклонение, дни", ascending=False).reset_index(drop=True)
+
+
+def snapshot_from_frames(dz: pd.DataFrame, unissued: pd.DataFrame, do_full: pd.DataFrame | None = None) -> dict:
     dz = ensure_dz_categories(dz)
     unissued = ensure_unissued_categories(unissued)
     dz_cols = [
@@ -275,17 +501,36 @@ def snapshot_from_frames(dz: pd.DataFrame, unissued: pd.DataFrame) -> dict:
     for c in un_out.select_dtypes(include="float").columns:
         un_out[c] = un_out[c].round(2)
 
+    do_payload = []
+    if do_full is not None and not do_full.empty:
+        do_cols = [
+            "Заявка", "Клиент", "Номер счета", "Ставка заказчика",
+            "Дата загрузки", "Дата выгрузки", "Дата оплаты клиента",
+            "Дата оплаты по договору", "Дата отправки", "Дата доставки",
+            "Дата прихода", "Ответственный сотрудник ДО", "_no_invoice",
+        ]
+        dfo = do_full[[c for c in do_cols if c in do_full.columns]].copy()
+        for c in ("Дата загрузки", "Дата выгрузки", "Дата оплаты клиента",
+                  "Дата оплаты по договору", "Дата отправки", "Дата доставки", "Дата прихода"):
+            if c in dfo.columns:
+                dfo[c] = dfo[c].map(_dt_str)
+        if "Ставка заказчика" in dfo.columns:
+            dfo["Ставка заказчика"] = pd.to_numeric(dfo["Ставка заказчика"], errors="coerce").fillna(0).round(2)
+        do_payload = json.loads(dfo.to_json(orient="records", force_ascii=False))
+
     return {
-        "version": 4,
+        "version": 5,
         "published_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "dz": json.loads(dz_out.to_json(orient="records", force_ascii=False)),
         "unissued": json.loads(un_out.to_json(orient="records", force_ascii=False)),
+        "do_full": do_payload,
     }
 
 
 def frames_from_snapshot(snap: dict):
     dz = pd.DataFrame(snap.get("dz", []))
     unissued = pd.DataFrame(snap.get("unissued", []))
+    do_full = pd.DataFrame(snap.get("do_full", []))
     for c in ("Дата счета", "Дата оплаты по договору", "Дата отправления"):
         if c in dz.columns:
             dz[c] = pd.to_datetime(dz[c], errors="coerce")
@@ -297,9 +542,25 @@ def frames_from_snapshot(snap: dict):
             unissued[c] = pd.to_datetime(unissued[c], errors="coerce")
     if "Сумма" in unissued.columns:
         unissued["Сумма"] = pd.to_numeric(unissued["Сумма"], errors="coerce").fillna(0)
+    for c in ("Дата загрузки", "Дата выгрузки", "Дата оплаты клиента",
+              "Дата оплаты по договору", "Дата отправки", "Дата доставки", "Дата прихода"):
+        if c in do_full.columns:
+            do_full[c] = pd.to_datetime(do_full[c], errors="coerce")
+    if "Ставка заказчика" in do_full.columns:
+        do_full["Ставка заказчика"] = pd.to_numeric(do_full["Ставка заказчика"], errors="coerce").fillna(0)
+    if not do_full.empty:
+        if "_no_invoice" not in do_full.columns and "Номер счета" in do_full.columns:
+            inv = do_full["Номер счета"].astype(str).str.strip()
+            do_full["_no_invoice"] = inv.isna() | (inv == "") | (inv.str.lower() == "nan") | (inv == "0")
+        if "_excluded" not in do_full.columns and "Клиент" in do_full.columns:
+            do_full["_excluded"] = do_full["Клиент"].map(exclude_client_from_unissued)
+        if "Месяц" not in do_full.columns and "Дата выгрузки" in do_full.columns:
+            do_full["Месяц"] = do_full["Дата выгрузки"].map(_month_label)
+        if "Ответственный сотрудник ДО" not in do_full.columns:
+            do_full["Ответственный сотрудник ДО"] = ""
     dz = ensure_dz_categories(dz)
     unissued = ensure_unissued_categories(unissued)
-    return dz, unissued
+    return dz, unissued, do_full
 
 
 
@@ -725,7 +986,7 @@ def render_plan_tab(plan_df):
 
 
 
-def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label=""):
+def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum, not_inv_det, not_sent_sum, not_sent_det, deferral_df, source_label=""):
     if source_label:
         st.caption(source_label)
     render_kpi(metrics)
@@ -733,6 +994,8 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
     tabs = st.tabs([
         "📋 Сводка по контрагентам",
         "📅 Планирование оплат",
+        "📄 Невыставленные счета",
+        "📬 Неотправленные заявки",
         "📈 Аналитика",
         "🔎 Детализация",
         "⬇️ Выгрузка",
@@ -753,69 +1016,69 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
         render_plan_tab(plan_df)
 
     with tabs[2]:
-        left, right = st.columns(2)
-        with left:
-            status = pd.DataFrame({
-                "Категория": [
-                    "Оплачено", "Неоплачено", "Просрочено", "Есть в ДЗ",
-                    "Подходит к оплате", "Не отправлено", "Нет ПДО", "Не выставлено",
-                ],
-                "Сумма": [
-                    metrics.get("Оплачено", 0), metrics.get("Неоплачено", 0),
-                    metrics.get("Просрочено", 0), metrics.get("Есть в ДЗ", 0),
-                    metrics.get("Подходит к оплате", 0), metrics.get("Не отправлено", 0),
-                    metrics.get("Нет ПДО", 0), metrics.get("Не выставлено", 0),
-                ],
-            })
-            status = status[status["Сумма"] > 0]
-            if not status.empty:
-                fig = px.pie(status, names="Категория", values="Сумма", hole=0.5, title="Структура")
-                st.plotly_chart(fig, use_container_width=True)
-        with right:
-            bar_df = pd.DataFrame({
-                "Показатель": [
-                    "Оборот", "Выставлено", "Оплачено", "Неоплачено", "Просрочено",
-                    "Есть в ДЗ", "Подходит к оплате", "Не отправлено", "Нет ПДО", "Не выставлено",
-                ],
-                "Сумма": [
-                    metrics.get("Оборот", 0), metrics.get("Выставлено", 0),
-                    metrics.get("Оплачено", 0), metrics.get("Неоплачено", 0),
-                    metrics.get("Просрочено", 0), metrics.get("Есть в ДЗ", 0),
-                    metrics.get("Подходит к оплате", 0), metrics.get("Не отправлено", 0),
-                    metrics.get("Нет ПДО", 0), metrics.get("Не выставлено", 0),
-                ],
-            })
-            fig = px.bar(bar_df, x="Показатель", y="Сумма", title="Ключевые показатели",
-                         labels={"Сумма": "Сумма, ₽"})
-            st.plotly_chart(fig, use_container_width=True)
-
-        if summary_f is not None and not summary_f.empty and "Оборот" in summary_f.columns:
-            tmp = summary_f.copy()
-            tmp["Оборот"] = pd.to_numeric(tmp["Оборот"], errors="coerce").fillna(0)
-            n = min(15, len(tmp))
-            if n > 0:
-                top = tmp.nlargest(n, "Оборот")
-                fig = px.bar(
-                    top.sort_values("Оборот"), x="Оборот", y="Контрагент", orientation="h",
-                    title="Топ контрагентов по обороту", labels={"Оборот": "Оборот, ₽"},
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-        if dz_f is not None and not dz_f.empty and "Дата счета" in dz_f.columns and dz_f["Дата счета"].notna().any():
-            monthly = dz_f.dropna(subset=["Дата счета"]).copy()
-            monthly["Месяц"] = monthly["Дата счета"].dt.to_period("M").dt.to_timestamp()
-            monthly = monthly.groupby("Месяц", as_index=False).agg(
-                Выставлено=("Сумма счета", "sum"),
-                Оплачено=("Оплачено", "sum"),
-                Просрочено=("Просрочено", "sum"),
-            )
-            fig = px.line(
-                monthly, x="Месяц", y=["Выставлено", "Оплачено", "Просрочено"], markers=True,
-                title="Динамика по месяцам", labels={"value": "Сумма, ₽", "variable": "Показатель"},
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        st.subheader("Невыставленные счета")
+        st.caption(
+            "Ставка заказчика > 2, нет счёта, нет даты оплаты клиента; исключены ИП и ООО «Взлет». "
+            "Месяцы — по дате выгрузки."
+        )
+        if not_inv_sum is None or not_inv_sum.empty:
+            st.info("Нет невыставленных заявок по заданным условиям.")
+        else:
+            st.dataframe(format_money_df(not_inv_sum, exclude={"Клиент", "Ответственный сотрудник ДО"}),
+                         use_container_width=True, hide_index=True, height=360)
+        st.markdown("**Детализация невыставленных заявок**")
+        if not_inv_det is None or not_inv_det.empty:
+            st.info("Нет строк детализации.")
+        else:
+            st.dataframe(format_money_df(not_inv_det, exclude={
+                "Номер заявки", "Заказчик/клиент", "Дата погрузки/загрузки", "Дата выгрузки",
+                "Номер счета", "Ответственный сотрудник ДО", "Месяц",
+            }), use_container_width=True, hide_index=True, height=360)
 
     with tabs[3]:
+        st.subheader("Неотправленные заявки")
+        st.caption(
+            "Есть счёт и/или дата прихода, но нет даты отправки, даты оплаты по договору и даты оплаты клиента; "
+            "исключены ИП и ООО «Взлет». Месяцы — по дате выгрузки."
+        )
+        if not_sent_sum is None or not_sent_sum.empty:
+            st.info("Нет неотправленных заявок по заданным условиям.")
+        else:
+            st.dataframe(format_money_df(not_sent_sum, exclude={"Клиент", "Ответственный сотрудник ДО"}),
+                         use_container_width=True, hide_index=True, height=360)
+        st.markdown("**Детализация неотправленных заявок**")
+        if not_sent_det is None or not_sent_det.empty:
+            st.info("Нет строк детализации.")
+        else:
+            st.dataframe(format_money_df(not_sent_det, exclude={
+                "Номер заявки", "Заказчик/клиент", "Дата погрузки/загрузки", "Дата выгрузки",
+                "Номер счета", "Дата прихода", "Ответственный сотрудник ДО", "Месяц",
+            }), use_container_width=True, hide_index=True, height=360)
+
+    with tabs[4]:
+        st.subheader("Сравнение отсрочки: по договору vs факт")
+        st.caption(
+            "Средняя отсрочка по договору = Дата оплаты по договору (ДЗ) − Дата выгрузки (ДО). "
+            "Фактический срок оплаты = Дата оплаты клиента (ДО) − Дата выгрузки (ДО)."
+        )
+        if deferral_df is None or deferral_df.empty:
+            st.info("Недостаточно данных для расчёта отсрочки (нужны дата выгрузки и даты оплаты).")
+        else:
+            st.dataframe(deferral_df, use_container_width=True, hide_index=True, height=420)
+            plot_df = deferral_df.dropna(subset=["Средняя отсрочка по договору, дни", "Фактический срок оплаты, дни"]).head(25)
+            if not plot_df.empty:
+                fig = px.bar(
+                    plot_df,
+                    x="Клиент",
+                    y=["Средняя отсрочка по договору, дни", "Фактический срок оплаты, дни"],
+                    barmode="group",
+                    title="Топ клиентов: отсрочка по договору vs фактический срок оплаты",
+                    labels={"value": "Дни", "variable": "Показатель"},
+                )
+                fig.update_layout(xaxis_tickangle=-35)
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tabs[5]:
         if dz_f is not None and not dz_f.empty:
             st.subheader("Детализация счетов (ДЗ)")
             search = st.text_input("Поиск по контрагенту, счёту или заявке", key="search_dz")
@@ -857,7 +1120,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label
                 use_container_width=True, hide_index=True, height=320,
             )
 
-    with tabs[4]:
+    with tabs[6]:
         if summary_f is not None and not summary_f.empty:
             csv = summary_f.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button("Скачать сводку (CSV)", data=csv, file_name="сводка_ДЗ.csv", mime="text/csv")
@@ -899,6 +1162,7 @@ with st.sidebar:
         do_file = st.file_uploader("Файл ДО (.xlsx)", type=["xlsx"], key="do")
 
 base_dz = base_unissued = None
+base_do_full = pd.DataFrame()
 source_mode = None
 
 # session_state: данные грузим один раз, фильтры их не трогают
@@ -913,17 +1177,21 @@ if is_admin and dz_file and do_file:
 if (not need_reload and st.session_state.get("base_dz") is not None):
     base_dz = st.session_state["base_dz"]
     base_unissued = st.session_state["base_unissued"]
+    base_do_full = st.session_state.get("base_do_full", pd.DataFrame())
     source_mode = st.session_state.get("source_mode", "published")
     if source_mode == "published" and st.session_state.get("published_at"):
         st.sidebar.caption(f"Опубликовано: {st.session_state['published_at']}")
 elif is_admin and dz_file and do_file:
     try:
         with st.spinner("Обработка Excel…"):
+            raw_do = read_source(do_file, header_row=4)
             base_dz = build_dz(read_source(dz_file, header_row=4))
-            base_unissued = build_unissued(read_source(do_file, header_row=4))
+            base_unissued = build_unissued(raw_do)
+            base_do_full = prepare_do_full(raw_do)
         source_mode = "live"
         st.session_state["base_dz"] = base_dz
         st.session_state["base_unissued"] = base_unissued
+        st.session_state["base_do_full"] = base_do_full
         st.session_state["source_mode"] = source_mode
         st.session_state["published_at"] = None
     except Exception as exc:
@@ -935,11 +1203,13 @@ else:
         if st.session_state.get("_data_key") == data_key and st.session_state.get("base_dz") is not None:
             base_dz = st.session_state["base_dz"]
             base_unissued = st.session_state["base_unissued"]
+            base_do_full = st.session_state.get("base_do_full", pd.DataFrame())
         else:
             with st.spinner("Подготовка данных…"):
-                base_dz, base_unissued = frames_from_snapshot(snap)
+                base_dz, base_unissued, base_do_full = frames_from_snapshot(snap)
             st.session_state["base_dz"] = base_dz
             st.session_state["base_unissued"] = base_unissued
+            st.session_state["base_do_full"] = base_do_full
             st.session_state["_data_key"] = data_key
         source_mode = "published"
         st.session_state["source_mode"] = source_mode
@@ -953,15 +1223,10 @@ if base_dz is None:
     st.info("Нет данных. Администратор: пароль → дз.xlsx + до.xlsx → «Опубликовать».")
     st.stop()
 
+if "base_do_full" not in st.session_state:
+    st.session_state["base_do_full"] = pd.DataFrame()
+base_do_full = st.session_state.get("base_do_full", pd.DataFrame())
 
-if base_dz is None:
-    st.info(
-        "Нет данных.\n\n"
-        "Администратор: пароль → дз.xlsx + до.xlsx → «Опубликовать для руководства»."
-    )
-    st.stop()
-
-# Категории уже посчитаны в frames_from_snapshot / build_*
 with st.sidebar:
     st.divider()
     st.header("Фильтры")
@@ -994,6 +1259,20 @@ metrics = metrics_from_summary(summary_f)
 
 plan_df = build_payment_plan(dz_f) if dz_f is not None and not dz_f.empty else pd.DataFrame()
 
+# Разделы Невыставленные / Неотправленные / аналитика отсрочки
+_do = st.session_state.get("base_do_full", pd.DataFrame())
+if _do is None or (isinstance(_do, pd.DataFrame) and _do.empty):
+    not_inv_sum = not_inv_det = not_sent_sum = not_sent_det = pd.DataFrame()
+    deferral_df = pd.DataFrame()
+else:
+    # фильтр по выбранным контрагентам (если есть)
+    do_f = _do
+    if selected_clients and "Клиент" in do_f.columns:
+        do_f = do_f[do_f["Клиент"].isin(selected_clients)]
+    not_inv_sum, not_inv_det = build_not_invoiced_section(do_f)
+    not_sent_sum, not_sent_det = build_not_sent_section(do_f)
+    deferral_df = build_deferral_analytics(dz_f, do_f)
+
 st.sidebar.caption(
     f"Строк ДЗ: {len(dz_f):,} · заявок ДО: {len(unissued_f):,}".replace(",", " ")
 )
@@ -1005,18 +1284,18 @@ if is_admin and source_mode == "live":
     elif st.sidebar.button("📢 Опубликовать для руководства", type="primary"):
         with st.sidebar:
             with st.spinner("Сжатие и загрузка снимка на GitHub…"):
-                snap = snapshot_from_frames(base_dz, base_unissued)
+                snap = snapshot_from_frames(base_dz, base_unissued, st.session_state.get("base_do_full"))
                 ok, msg = publish_snapshot(snap)
             if ok:
                 st.success(msg)
                 st.balloons()
                 _load_published_snapshot_cached.clear()
-                st.session_state.pop("base_dz", None); st.session_state.pop("base_unissued", None); st.session_state.pop("_data_key", None)
+                for _k in ("base_dz", "base_unissued", "base_do_full", "_data_key"): st.session_state.pop(_k, None)
             else:
                 st.error(msg)
 
 label = "Данные из загруженных файлов" if source_mode == "live" else "Опубликованные данные"
-render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, source_label=label)
+render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum, not_inv_det, not_sent_sum, not_sent_det, deferral_df, source_label=label)
 
 with st.expander("Пояснения к расчётам"):
     st.markdown(
