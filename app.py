@@ -310,8 +310,7 @@ def prepare_do_full(raw_do: pd.DataFrame) -> pd.DataFrame:
 
 def build_not_invoiced_section(do_full: pd.DataFrame):
     """Невыставленные: ставка > 2, нет счёта, нет оплаты клиента, не ИП/Взлет.
-    Для ООО ОПХ, Газпромнефть-Снабжение, Фактор, Транснефть-логистика:
-    заявки с выгрузкой в авг/сен/окт → дата выгрузки 01.11.2026 (учёт в ноябре).
+    Спец. переносы дат и исключения по клиентам — см. ниже.
     """
     if do_full is None or do_full.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -325,14 +324,13 @@ def build_not_invoiced_section(do_full: pd.DataFrame):
     if work.empty:
         return pd.DataFrame(), pd.DataFrame()
 
+    work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce", dayfirst=True)
+    work["Месяц"] = work["Дата выгрузки"].map(_month_label)
+
     # Перенос авг–окт → 01.11.2026 для спец. клиентов
     special_keys = (
-        "опх",
-        "газпромнефть-снабжение",
-        "газпромнефть снабжение",
-        "фактор",
-        "транснефть-логистика",
-        "транснефть логистика",
+        "опх", "газпромнефть-снабжение", "газпромнефть снабжение",
+        "фактор", "транснефть-логистика", "транснефть логистика",
     )
 
     def _is_special(name: str) -> bool:
@@ -340,37 +338,40 @@ def build_not_invoiced_section(do_full: pd.DataFrame):
         return any(k in s for k in special_keys)
 
     is_spec = work["Клиент"].map(_is_special)
-    if "Дата выгрузки" in work.columns:
-        unload = pd.to_datetime(work["Дата выгрузки"], errors="coerce")
-        in_aso = unload.dt.month.isin([8, 9, 10])
-        shift = is_spec & in_aso
-        work.loc[shift, "Дата выгрузки"] = pd.Timestamp("2026-11-01")
-        work.loc[shift, "Месяц"] = "2026-11"
+    unload = work["Дата выгрузки"]
+    in_aso = unload.dt.month.isin([8, 9, 10])
+    shift = is_spec & in_aso & unload.notna()
+    work.loc[shift, "Дата выгрузки"] = pd.Timestamp("2026-11-01")
+    work.loc[shift, "Месяц"] = "2026-11"
 
-    # Исключить суммы янв–сен 2026 для ряда клиентов
-    exclude_clients_keys = (
-        "сд рикос", "рикос",
-        "интернет решения", "интернет-решения",
-        "фк открытие", "банк \"фк открытие\"", "открытие",
-        "роксор", "роксор консьюмер",
-        "элита-центр", "элита центр",
-    )
-
+    # Исключить янв–сен 2026 для РИКОС, Интернет Решения, ФК Открытие, Роксор, Элита-Центр
     def _is_exclude_client(name: str) -> bool:
-        s = str(name or "").lower().replace("«", '"').replace("»", '"')
-        if any(k in s for k in ("сд рикос", "рикос", "интернет решения", "интернет-решения",
-                                 "роксор", "элита-центр", "элита центр")):
+        s = str(name or "").lower().replace("«", '"').replace("»", '"').replace("“", '"').replace("”", '"')
+        s = s.replace("ё", "е")
+        if "рикос" in s:
             return True
-        # ПАО Банк ФК Открытие — не любой «открытие»
+        if "интернет" in s and "решен" in s:
+            return True
+        if "роксор" in s:
+            return True
+        if "элита" in s and "центр" in s:
+            return True
         if "открытие" in s and ("фк" in s or "банк" in s):
             return True
         return False
 
-    if "Дата выгрузки" in work.columns:
-        unload = pd.to_datetime(work["Дата выгрузки"], errors="coerce")
-        in_jan_sep_2026 = (unload.dt.year == 2026) & (unload.dt.month >= 1) & (unload.dt.month <= 9)
-        drop_mask = work["Клиент"].map(_is_exclude_client) & in_jan_sep_2026
-        work = work.loc[~drop_mask].copy()
+    is_excl = work["Клиент"].map(_is_exclude_client)
+    # и по дате, и по метке месяца (надёжнее)
+    unload = work["Дата выгрузки"]
+    in_jan_sep_2026 = (
+        ((unload.dt.year == 2026) & (unload.dt.month >= 1) & (unload.dt.month <= 9))
+        | work["Месяц"].isin([f"2026-{m:02d}" for m in range(1, 10)])
+    )
+    drop_mask = is_excl & in_jan_sep_2026
+    work = work.loc[~drop_mask].copy()
+
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
     detail = work[[
         "Заявка", "Клиент", "Дата загрузки", "Дата выгрузки",
@@ -406,6 +407,13 @@ def build_not_invoiced_section(do_full: pd.DataFrame):
     pivot = pivot[months]
     pivot["Итого"] = pivot[months].sum(axis=1)
     pivot = pivot.sort_values("Итого", ascending=False).reset_index()
+
+    # Строка ИТОГО сверху — суммы по месяцам
+    total = {c: pivot[c].sum() if c not in ("Клиент", "Ответственный сотрудник ДО") else "" for c in pivot.columns}
+    total["Клиент"] = "ИТОГО"
+    total["Ответственный сотрудник ДО"] = ""
+    pivot = pd.concat([pd.DataFrame([total]), pivot], ignore_index=True)
+
     return pivot, detail
 
 
@@ -625,7 +633,7 @@ def frames_from_snapshot(snap: dict):
     for c in ("Дата загрузки", "Дата выгрузки", "Дата оплаты клиента",
               "Дата оплаты по договору", "Дата отправки", "Дата доставки", "Дата прихода"):
         if c in do_full.columns:
-            do_full[c] = pd.to_datetime(do_full[c], errors="coerce")
+            do_full[c] = pd.to_datetime(do_full[c], errors="coerce", dayfirst=True)
     if "Ставка заказчика" in do_full.columns:
         do_full["Ставка заказчика"] = pd.to_numeric(do_full["Ставка заказчика"], errors="coerce").fillna(0)
     if not do_full.empty:
