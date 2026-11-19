@@ -347,6 +347,31 @@ def build_not_invoiced_section(do_full: pd.DataFrame):
         work.loc[shift, "Дата выгрузки"] = pd.Timestamp("2026-11-01")
         work.loc[shift, "Месяц"] = "2026-11"
 
+    # Исключить суммы янв–сен 2026 для ряда клиентов
+    exclude_clients_keys = (
+        "сд рикос", "рикос",
+        "интернет решения", "интернет-решения",
+        "фк открытие", "банк \"фк открытие\"", "открытие",
+        "роксор", "роксор консьюмер",
+        "элита-центр", "элита центр",
+    )
+
+    def _is_exclude_client(name: str) -> bool:
+        s = str(name or "").lower().replace("«", '"').replace("»", '"')
+        if any(k in s for k in ("сд рикос", "рикос", "интернет решения", "интернет-решения",
+                                 "роксор", "элита-центр", "элита центр")):
+            return True
+        # ПАО Банк ФК Открытие — не любой «открытие»
+        if "открытие" in s and ("фк" in s or "банк" in s):
+            return True
+        return False
+
+    if "Дата выгрузки" in work.columns:
+        unload = pd.to_datetime(work["Дата выгрузки"], errors="coerce")
+        in_jan_sep_2026 = (unload.dt.year == 2026) & (unload.dt.month >= 1) & (unload.dt.month <= 9)
+        drop_mask = work["Клиент"].map(_is_exclude_client) & in_jan_sep_2026
+        work = work.loc[~drop_mask].copy()
+
     detail = work[[
         "Заявка", "Клиент", "Дата загрузки", "Дата выгрузки",
         "Номер счета", "Ставка заказчика", "Ответственный сотрудник ДО", "Месяц",
@@ -402,7 +427,7 @@ def build_not_sent_section(do_full: pd.DataFrame):
         (has_invoice | has_arrival)
         & no_sent & no_due & no_client_pay
         & ~do_full["_excluded"]
-        & (do_full["Ставка заказчика"] != 0)
+        & (do_full["Ставка заказчика"] > 2)
     )
     detail = do_full.loc[mask, [
         "Заявка", "Клиент", "Дата загрузки", "Дата выгрузки",
@@ -1146,21 +1171,6 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            monthly_cnt = monthly.groupby("Месяц", as_index=False).agg(
-                **{
-                    "Выставлено, шт": ("Сумма счета", "count"),
-                    "Оплачено, шт": ("Оплачено", lambda s: int((pd.to_numeric(s, errors="coerce").fillna(0) > 0).sum())),
-                    "Просрочено, шт": ("Просрочено", lambda s: int((pd.to_numeric(s, errors="coerce").fillna(0) > 0).sum())),
-                }
-            )
-            fig2 = px.line(
-                monthly_cnt, x="Месяц",
-                y=["Выставлено, шт", "Оплачено, шт", "Просрочено, шт"],
-                markers=True,
-                title="Количество счетов: выставлено / оплачено / просрочено",
-                labels={"value": "Количество", "variable": "Показатель"},
-            )
-            st.plotly_chart(fig2, use_container_width=True)
         else:
             st.info("Нет дат счетов для помесячной динамики.")
 
