@@ -309,7 +309,10 @@ def prepare_do_full(raw_do: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_not_invoiced_section(do_full: pd.DataFrame):
-    """Невыставленные: ставка > 2, нет счёта, нет оплаты клиента, не ИП/Взлет."""
+    """Невыставленные: ставка > 2, нет счёта, нет оплаты клиента, не ИП/Взлет.
+    Для ООО ОПХ, Газпромнефть-Снабжение, Фактор, Транснефть-логистика:
+    заявки с выгрузкой в авг/сен/окт → дата выгрузки 01.11.2026 (учёт в ноябре).
+    """
     if do_full is None or do_full.empty:
         return pd.DataFrame(), pd.DataFrame()
     mask = (
@@ -318,7 +321,33 @@ def build_not_invoiced_section(do_full: pd.DataFrame):
         & do_full["Дата оплаты клиента"].isna()
         & ~do_full["_excluded"]
     )
-    detail = do_full.loc[mask, [
+    work = do_full.loc[mask].copy()
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Перенос авг–окт → 01.11.2026 для спец. клиентов
+    special_keys = (
+        "опх",
+        "газпромнефть-снабжение",
+        "газпромнефть снабжение",
+        "фактор",
+        "транснефть-логистика",
+        "транснефть логистика",
+    )
+
+    def _is_special(name: str) -> bool:
+        s = str(name or "").lower().replace("«", '"').replace("»", '"').replace("“", '"').replace("”", '"')
+        return any(k in s for k in special_keys)
+
+    is_spec = work["Клиент"].map(_is_special)
+    if "Дата выгрузки" in work.columns:
+        unload = pd.to_datetime(work["Дата выгрузки"], errors="coerce")
+        in_aso = unload.dt.month.isin([8, 9, 10])
+        shift = is_spec & in_aso
+        work.loc[shift, "Дата выгрузки"] = pd.Timestamp("2026-11-01")
+        work.loc[shift, "Месяц"] = "2026-11"
+
+    detail = work[[
         "Заявка", "Клиент", "Дата загрузки", "Дата выгрузки",
         "Номер счета", "Ставка заказчика", "Ответственный сотрудник ДО", "Месяц",
     ]].copy()
@@ -326,17 +355,12 @@ def build_not_invoiced_section(do_full: pd.DataFrame):
         "Заявка": "Номер заявки",
         "Клиент": "Заказчик/клиент",
         "Дата загрузки": "Дата погрузки/загрузки",
-        "Ставка заказчика": "Ставка заказчика",
     })
-    if detail.empty:
-        return pd.DataFrame(), detail
 
-    pivot_src = do_full.loc[mask].copy()
-    pivot_src = pivot_src[pivot_src["Месяц"].notna()]
+    pivot_src = work[work["Месяц"].notna()].copy()
     if pivot_src.empty:
         summary = (
-            do_full.loc[mask]
-            .groupby(["Клиент", "Ответственный сотрудник ДО"], as_index=False)["Ставка заказчика"]
+            work.groupby(["Клиент", "Ответственный сотрудник ДО"], as_index=False)["Ставка заказчика"]
             .sum()
             .rename(columns={"Ставка заказчика": "Итого"})
         )
@@ -422,38 +446,67 @@ def build_not_sent_section(do_full: pd.DataFrame):
     return pivot, detail
 
 
-def build_deferral_analytics(dz: pd.DataFrame, do_full: pd.DataFrame) -> pd.DataFrame:
+def _norm_request(v) -> str:
+    s = str(v).strip()
+    if s.lower() in ("nan", "none", ""):
+        return ""
+    if s.endswith(".0"):
+        s = s[:-2]
+    # убрать пробелы и ведущие нули аккуратно
+    s = s.replace(" ", "")
+    return s
+
+
+def build_deferral_analytics(dz: pd.DataFrame, do_full: pd.DataFrame):
     """
-    Средняя отсрочка по договору = Дата оплаты по договору (ДЗ) − Дата выгрузки (ДО)
-    Фактический срок оплаты = Дата оплаты клиента (ДО) − Дата выгрузки (ДО)
-    По номеру заявки, среднее по клиенту (дни).
+    Заявка со счётом: Дата оплаты по договору (ДЗ) − Дата выгрузки (ДО).
+    Факт: Дата оплаты клиента (ДО) − Дата выгрузки (ДО).
+    Возвращает (сводка по клиентам, series фактических сроков для гистограммы).
     """
+    empty = pd.DataFrame(), pd.Series(dtype=float)
     if dz is None or dz.empty or do_full is None or do_full.empty:
-        return pd.DataFrame()
+        return empty
+    if "Заявка" not in dz.columns or "Дата оплаты по договору" not in dz.columns:
+        return empty
+    if "Заявка" not in do_full.columns or "Дата выгрузки" not in do_full.columns:
+        return empty
 
     dz_part = dz.copy()
-    if "Заявка" not in dz_part.columns or "Дата оплаты по договору" not in dz_part.columns:
-        return pd.DataFrame()
-    dz_part["Заявка"] = dz_part["Заявка"].astype(str).str.strip()
+    dz_part["_req"] = dz_part["Заявка"].map(_norm_request)
+    dz_part = dz_part[dz_part["_req"] != ""]
+    # только строки ДЗ с датой оплаты по договору (есть счёт/обязательство)
+    dz_part = dz_part[dz_part["Дата оплаты по договору"].notna()]
     dz_due = (
-        dz_part.dropna(subset=["Дата оплаты по договору"])
-        .groupby("Заявка", as_index=False)["Дата оплаты по договору"]
-        .min()
+        dz_part.groupby("_req", as_index=False)
+        .agg(**{"Дата оплаты по договору": ("Дата оплаты по договору", "min")})
     )
 
     do_part = do_full.copy()
-    do_part["Заявка"] = do_part["Заявка"].astype(str).str.strip()
-    do_use = do_part[[
-        "Заявка", "Клиент", "Дата выгрузки", "Дата оплаты клиента"
-    ]].copy()
+    do_part["_req"] = do_part["Заявка"].map(_norm_request)
+    do_part = do_part[do_part["_req"] != ""]
+    # заявки, по которым есть счёт в ДО или есть в ДЗ
+    has_invoice = ~do_part["_no_invoice"] if "_no_invoice" in do_part.columns else True
+    do_part = do_part.loc[has_invoice | do_part["_req"].isin(set(dz_due["_req"]))].copy()
 
-    merged = do_use.merge(dz_due, on="Заявка", how="left")
+    do_use = do_part[[
+        "_req", "Клиент", "Дата выгрузки", "Дата оплаты клиента"
+    ]].drop_duplicates(subset=["_req"], keep="first")
+
+    merged = do_use.merge(dz_due, on="_req", how="inner")
+    merged = merged[merged["Дата выгрузки"].notna()]
+
     merged["Отсрочка по договору, дни"] = (
-        merged["Дата оплаты по договору"] - merged["Дата выгрузки"]
+        pd.to_datetime(merged["Дата оплаты по договору"]) - pd.to_datetime(merged["Дата выгрузки"])
     ).dt.days
     merged["Фактический срок оплаты, дни"] = (
-        merged["Дата оплаты клиента"] - merged["Дата выгрузки"]
+        pd.to_datetime(merged["Дата оплаты клиента"]) - pd.to_datetime(merged["Дата выгрузки"])
     ).dt.days
+
+    fact_series = merged["Фактический срок оплаты, дни"].dropna()
+    fact_series = fact_series[fact_series.between(-30, 365)]  # отсечь явный мусор
+
+    if "Клиент" not in merged.columns:
+        return empty
 
     agg = (
         merged.groupby("Клиент", as_index=False)
@@ -461,16 +514,18 @@ def build_deferral_analytics(dz: pd.DataFrame, do_full: pd.DataFrame) -> pd.Data
             **{
                 "Средняя отсрочка по договору, дни": ("Отсрочка по договору, дни", "mean"),
                 "Фактический срок оплаты, дни": ("Фактический срок оплаты, дни", "mean"),
-                "Заявок": ("Заявка", "count"),
+                "Заявок": ("_req", "count"),
             }
         )
     )
     for c in ("Средняя отсрочка по договору, дни", "Фактический срок оплаты, дни"):
-        agg[c] = agg[c].round(1)
+        agg[c] = pd.to_numeric(agg[c], errors="coerce").round(1)
     agg["Отклонение, дни"] = (
         agg["Фактический срок оплаты, дни"] - agg["Средняя отсрочка по договору, дни"]
     ).round(1)
-    return agg.sort_values("Отклонение, дни", ascending=False).reset_index(drop=True)
+    agg = agg.sort_values("Отклонение, дни", ascending=False).reset_index(drop=True)
+    return agg, fact_series
+
 
 
 def snapshot_from_frames(dz: pd.DataFrame, unissued: pd.DataFrame, do_full: pd.DataFrame | None = None) -> dict:
@@ -986,7 +1041,7 @@ def render_plan_tab(plan_df):
 
 
 
-def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum, not_inv_det, not_sent_sum, not_sent_det, deferral_df, source_label=""):
+def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum, not_inv_det, not_sent_sum, not_sent_det, deferral_df, fact_deferral_series=None, source_label=""):
     if source_label:
         st.caption(source_label)
     render_kpi(metrics)
@@ -1056,27 +1111,88 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
             }), use_container_width=True, hide_index=True, height=360)
 
     with tabs[4]:
+        st.subheader("Топ контрагентов по обороту")
+        if summary_f is not None and not summary_f.empty and "Оборот" in summary_f.columns:
+            tmp = summary_f.copy()
+            tmp["Оборот"] = pd.to_numeric(tmp["Оборот"], errors="coerce").fillna(0)
+            n = min(15, len(tmp))
+            if n > 0:
+                top = tmp.nlargest(n, "Оборот")
+                fig = px.bar(
+                    top.sort_values("Оборот"),
+                    x="Оборот", y="Контрагент", orientation="h",
+                    title="Топ-15 по обороту",
+                    labels={"Оборот": "Оборот, ₽"},
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Нет данных для топа по обороту.")
+
+        st.subheader("Динамика по месяцам (суммы)")
+        if dz_f is not None and not dz_f.empty and "Дата счета" in dz_f.columns and dz_f["Дата счета"].notna().any():
+            monthly = dz_f.dropna(subset=["Дата счета"]).copy()
+            monthly["Месяц"] = monthly["Дата счета"].dt.to_period("M").dt.to_timestamp()
+            monthly_sum = monthly.groupby("Месяц", as_index=False).agg(
+                Выставлено=("Сумма счета", "sum"),
+                Оплачено=("Оплачено", "sum"),
+                Просрочено=("Просрочено", "sum"),
+            )
+            fig = px.line(
+                monthly_sum, x="Месяц",
+                y=["Выставлено", "Оплачено", "Просрочено"],
+                markers=True,
+                title="Суммы: выставлено / оплачено / просрочено",
+                labels={"value": "Сумма, ₽", "variable": "Показатель"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            monthly_cnt = monthly.groupby("Месяц", as_index=False).agg(
+                **{
+                    "Выставлено, шт": ("Сумма счета", "count"),
+                    "Оплачено, шт": ("Оплачено", lambda s: int((pd.to_numeric(s, errors="coerce").fillna(0) > 0).sum())),
+                    "Просрочено, шт": ("Просрочено", lambda s: int((pd.to_numeric(s, errors="coerce").fillna(0) > 0).sum())),
+                }
+            )
+            fig2 = px.line(
+                monthly_cnt, x="Месяц",
+                y=["Выставлено, шт", "Оплачено, шт", "Просрочено, шт"],
+                markers=True,
+                title="Количество счетов: выставлено / оплачено / просрочено",
+                labels={"value": "Количество", "variable": "Показатель"},
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("Нет дат счетов для помесячной динамики.")
+
         st.subheader("Сравнение отсрочки: по договору vs факт")
         st.caption(
-            "Средняя отсрочка по договору = Дата оплаты по договору (ДЗ) − Дата выгрузки (ДО). "
-            "Фактический срок оплаты = Дата оплаты клиента (ДО) − Дата выгрузки (ДО)."
+            "Отсрочка по договору = Дата оплаты по договору (ДЗ, по номеру заявки) − Дата выгрузки (ДО). "
+            "Факт = Дата оплаты клиента (ДО) − Дата выгрузки (ДО)."
         )
         if deferral_df is None or deferral_df.empty:
-            st.info("Недостаточно данных для расчёта отсрочки (нужны дата выгрузки и даты оплаты).")
+            st.info("Недостаточно данных для расчёта отсрочки.")
         else:
-            st.dataframe(deferral_df, use_container_width=True, hide_index=True, height=420)
-            plot_df = deferral_df.dropna(subset=["Средняя отсрочка по договору, дни", "Фактический срок оплаты, дни"]).head(25)
-            if not plot_df.empty:
-                fig = px.bar(
-                    plot_df,
-                    x="Клиент",
-                    y=["Средняя отсрочка по договору, дни", "Фактический срок оплаты, дни"],
-                    barmode="group",
-                    title="Топ клиентов: отсрочка по договору vs фактический срок оплаты",
-                    labels={"value": "Дни", "variable": "Показатель"},
-                )
-                fig.update_layout(xaxis_tickangle=-35)
-                st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(deferral_df, use_container_width=True, hide_index=True, height=360)
+
+        st.subheader("Распределение фактических сроков оплаты")
+        st.caption("По какой отсрочке (в днях) приходится наибольшая масса оплат.")
+        if fact_deferral_series is None or len(fact_deferral_series) == 0:
+            st.info("Нет фактических сроков оплаты для диаграммы.")
+        else:
+            hist_df = pd.DataFrame({"Фактический срок, дни": fact_deferral_series})
+            # Корзины по 15 дней
+            bins = list(range(0, int(max(hist_df["Фактический срок, дни"].max(), 1)) + 16, 15))
+            if len(bins) < 2:
+                bins = [0, 15, 30, 45, 60, 90, 120, 180, 365]
+            hist_df["Корзина"] = pd.cut(hist_df["Фактический срок, дни"], bins=bins, right=False)
+            dist = hist_df.groupby("Корзина", observed=False).size().reset_index(name="Количество")
+            dist["Корзина"] = dist["Корзина"].astype(str)
+            fig3 = px.bar(
+                dist, x="Корзина", y="Количество",
+                title="Масса фактических сроков оплаты (дни)",
+                labels={"Корзина": "Интервал дней", "Количество": "Число заявок"},
+            )
+            st.plotly_chart(fig3, use_container_width=True)
 
     with tabs[5]:
         if dz_f is not None and not dz_f.empty:
@@ -1264,6 +1380,7 @@ _do = st.session_state.get("base_do_full", pd.DataFrame())
 if _do is None or (isinstance(_do, pd.DataFrame) and _do.empty):
     not_inv_sum = not_inv_det = not_sent_sum = not_sent_det = pd.DataFrame()
     deferral_df = pd.DataFrame()
+    fact_deferral_series = pd.Series(dtype=float)
 else:
     # фильтр по выбранным контрагентам (если есть)
     do_f = _do
@@ -1271,7 +1388,7 @@ else:
         do_f = do_f[do_f["Клиент"].isin(selected_clients)]
     not_inv_sum, not_inv_det = build_not_invoiced_section(do_f)
     not_sent_sum, not_sent_det = build_not_sent_section(do_f)
-    deferral_df = build_deferral_analytics(dz_f, do_f)
+    deferral_df, fact_deferral_series = build_deferral_analytics(dz_f, do_f)
 
 st.sidebar.caption(
     f"Строк ДЗ: {len(dz_f):,} · заявок ДО: {len(unissued_f):,}".replace(",", " ")
@@ -1295,7 +1412,7 @@ if is_admin and source_mode == "live":
                 st.error(msg)
 
 label = "Данные из загруженных файлов" if source_mode == "live" else "Опубликованные данные"
-render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum, not_inv_det, not_sent_sum, not_sent_det, deferral_df, source_label=label)
+render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum, not_inv_det, not_sent_sum, not_sent_det, deferral_df, fact_deferral_series, source_label=label)
 
 with st.expander("Пояснения к расчётам"):
     st.markdown(
