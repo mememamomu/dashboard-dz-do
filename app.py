@@ -262,7 +262,11 @@ def ensure_dz_categories(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def ensure_unissued_categories(df: pd.DataFrame) -> pd.DataFrame:
-    """Заявки ДО без счетов. Ставка >= 10; ИП/Взлет всегда вне; спец.клиенты янв–сен 2026 вне."""
+    """
+    Не выставлено — те же правила, что вкладка «Невыставленные счета»:
+    нет счёта, нет даты оплаты клиента, ставка >= 10, не ИП/Взлет,
+    спец.клиенты янв–сен 2026 вне, СКАЙ ТРЕЙД апрель 2026 вне.
+    """
     if df is None or df.empty:
         return df if df is not None else pd.DataFrame()
     df = df.copy()
@@ -272,29 +276,40 @@ def ensure_unissued_categories(df: pd.DataFrame) -> pd.DataFrame:
     if "Номер счета" not in df.columns:
         df["Номер счета"] = ""
     inv = df["Номер счета"].astype(str).str.strip()
-    no_invoice = inv.isna() | (inv == "") | (inv.str.lower() == "nan") | (inv.str.lower() == "none") | (inv == "0")
+    no_invoice = (
+        inv.isna() | (inv == "") | (inv.str.lower() == "nan")
+        | (inv.str.lower() == "none") | (inv == "0")
+    )
     if "Дата оплаты клиента" in df.columns:
         df["Дата оплаты клиента"] = pd.to_datetime(df["Дата оплаты клиента"], errors="coerce")
     else:
         df["Дата оплаты клиента"] = pd.NaT
-    if "Контрагент" not in df.columns:
-        df["Контрагент"] = ""
-    excluded = df["Контрагент"].map(exclude_client_from_unissued)
+    no_client_pay = df["Дата оплаты клиента"].isna()
 
-    # ставка < 10 — не учитываем
+    client_col = "Контрагент" if "Контрагент" in df.columns else ("Клиент" if "Клиент" in df.columns else None)
+    if client_col is None:
+        df["Контрагент"] = ""
+        client_col = "Контрагент"
+    excluded = df[client_col].map(exclude_client_from_unissued)
     rate_ok = df["Сумма"] >= MIN_RATE
 
-    # спец.клиенты: заявки без счетов за янв–сен 2026 не учитываем
-    special = df["Контрагент"].map(is_special_unissued_exclude_client)
+    # янв–сен 2026 для расширенного списка клиентов (как во вкладке)
     period_drop = pd.Series(False, index=df.index)
+    unload = None
     if "Дата выгрузки" in df.columns:
         unload = pd.to_datetime(df["Дата выгрузки"], errors="coerce", dayfirst=True)
-        period_drop = special & (unload.dt.year == 2026) & (unload.dt.month >= 1) & (unload.dt.month <= 9)
     elif "Дата загрузки" in df.columns:
-        load = pd.to_datetime(df["Дата загрузки"], errors="coerce", dayfirst=True)
-        period_drop = special & (load.dt.year == 2026) & (load.dt.month >= 1) & (load.dt.month <= 9)
+        unload = pd.to_datetime(df["Дата загрузки"], errors="coerce", dayfirst=True)
+    if unload is not None:
+        is_excl = df[client_col].map(_is_jan_sep_2026_exclude_client)
+        in_jan_sep = (unload.dt.year == 2026) & (unload.dt.month >= 1) & (unload.dt.month <= 9)
+        period_drop = is_excl & in_jan_sep
+        # СКАЙ ТРЕЙД — апрель 2026
+        name = df[client_col].astype(str).str.lower()
+        is_sky = name.str.contains("скай", na=False) & name.str.contains("трейд", na=False)
+        period_drop = period_drop | (is_sky & (unload.dt.year == 2026) & (unload.dt.month == 4))
 
-    valid = no_invoice & rate_ok & ~excluded & ~period_drop
+    valid = no_invoice & no_client_pay & rate_ok & ~excluded & ~period_drop
     df["Не отправлено"] = df["Сумма"].where(valid, 0)
     df["Не выставлено"] = df["Сумма"].where(valid, 0)
     return df
