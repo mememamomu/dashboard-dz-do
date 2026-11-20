@@ -1322,6 +1322,8 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
                 title="Суммы: выставлено / оплачено / просрочено",
                 labels={"value": "Сумма, ₽", "variable": "Показатель"},
             )
+            # шаг оси Y — 10 млн ₽
+            fig.update_yaxes(dtick=10_000_000, tickformat=",.0f")
             st.plotly_chart(fig, width="stretch")
 
         else:
