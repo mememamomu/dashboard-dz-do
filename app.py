@@ -12,7 +12,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Финансовый дашборд ДЗ / ДО", page_icon="📊", layout="wide")
-APP_VERSION = "2026-11-20-v5"
+APP_VERSION = "2026-11-20-v6"
 
 
 
@@ -1658,40 +1658,46 @@ with st.sidebar:
             )
 
 dz_f, unissued_f = apply_filters(base_dz, base_unissued, selected_clients, selected_payers, invoice_range)
-summary_f = build_summary(dz_f, unissued_f)
-metrics = metrics_from_summary(summary_f)
 
-plan_df = build_payment_plan(dz_f) if dz_f is not None and not dz_f.empty else pd.DataFrame()
-
-# Разделы Невыставленные / Неотправленные / аналитика отсрочки
+# Разделы Невыставленные / Неотправленные — единый источник с KPI
 _do = st.session_state.get("base_do_full", pd.DataFrame())
-if _do is None or (isinstance(_do, pd.DataFrame) and _do.empty):
-    not_inv_sum = not_inv_det = not_sent_sum = not_sent_det = pd.DataFrame()
-    deferral_df = pd.DataFrame()
-    fact_deferral_series = pd.Series(dtype=float)
-else:
-    # фильтр по выбранным контрагентам (если есть)
+not_inv_sum = not_inv_det = not_sent_sum = not_sent_det = pd.DataFrame()
+deferral_df = pd.DataFrame()
+fact_deferral_series = pd.Series(dtype=float)
+
+if _do is not None and isinstance(_do, pd.DataFrame) and not _do.empty:
     do_f = _do
     if selected_clients and "Клиент" in do_f.columns:
         do_f = do_f[do_f["Клиент"].isin(selected_clients)]
+
+    # Единый отбор невыставленных
+    unissued_work = filter_unissued_rows(do_f)
     not_inv_sum, not_inv_det = build_not_invoiced_section(do_f)
     not_sent_sum, not_sent_det = build_not_sent_section(do_f)
     deferral_df, fact_deferral_series = build_deferral_analytics(dz_f, do_f)
 
-    # KPI «Не выставлено» = ровно сумма вкладки «Невыставленные счета»
-    inv_total = None
-    if not_inv_det is not None and not not_inv_det.empty and "Ставка заказчика" in not_inv_det.columns:
-        inv_total = float(pd.to_numeric(not_inv_det["Ставка заказчика"], errors="coerce").fillna(0).sum())
-    elif not_inv_sum is not None and not not_inv_sum.empty and "Итого" in not_inv_sum.columns:
-        _tmp = not_inv_sum.copy()
-        if "Клиент" in _tmp.columns:
-            _tmp = _tmp[_tmp["Клиент"].astype(str) != "ИТОГО"]
-        inv_total = float(pd.to_numeric(_tmp["Итого"], errors="coerce").fillna(0).sum())
-    if inv_total is not None:
-        metrics["Не выставлено"] = inv_total
-        metrics["Оборот"] = float(metrics.get("Выставлено", 0)) + inv_total
-        metrics["Неоплачено"] = float(metrics["Оборот"]) - float(metrics.get("Оплачено", 0))
-        metrics["Не отправлено"] = float(metrics.get("Нет в ПДЗ", 0)) + inv_total
+    # Подмена unissued_f тем же набором — чтобы сводка и KPI совпали с вкладкой
+    if unissued_work is not None and not unissued_work.empty:
+        unissued_f = pd.DataFrame({
+            "Контрагент": unissued_work["Клиент"].astype(str),
+            "Заявка": unissued_work["Заявка"] if "Заявка" in unissued_work.columns else "",
+            "Номер счета": unissued_work["Номер счета"] if "Номер счета" in unissued_work.columns else "",
+            "Сумма": pd.to_numeric(unissued_work["Ставка заказчика"], errors="coerce").fillna(0),
+            "Дата загрузки": unissued_work["Дата загрузки"] if "Дата загрузки" in unissued_work.columns else pd.NaT,
+            "Дата выгрузки": unissued_work["Дата выгрузки"] if "Дата выгрузки" in unissued_work.columns else pd.NaT,
+            "Дата оплаты клиента": pd.NaT,
+            "Бухгалтер": unissued_work["Ответственный сотрудник ДО"] if "Ответственный сотрудник ДО" in unissued_work.columns else "",
+            "Не выставлено": pd.to_numeric(unissued_work["Ставка заказчика"], errors="coerce").fillna(0),
+            "Не отправлено": pd.to_numeric(unissued_work["Ставка заказчика"], errors="coerce").fillna(0),
+        })
+    else:
+        unissued_f = pd.DataFrame(columns=[
+            "Контрагент", "Заявка", "Номер счета", "Сумма", "Не выставлено", "Не отправлено"
+        ])
+
+summary_f = build_summary(dz_f, unissued_f)
+metrics = metrics_from_summary(summary_f)
+plan_df = build_payment_plan(dz_f) if dz_f is not None and not dz_f.empty else pd.DataFrame()
 
 st.sidebar.caption(
     f"Строк ДЗ: {len(dz_f):,} · заявок ДО: {len(unissued_f):,}".replace(",", " ")
