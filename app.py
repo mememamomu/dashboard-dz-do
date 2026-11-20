@@ -12,7 +12,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Финансовый дашборд ДЗ / ДО", page_icon="📊", layout="wide")
-APP_VERSION = "2026-11-20-v3"
+APP_VERSION = "2026-11-20-v4"
 
 
 
@@ -1600,6 +1600,21 @@ else:
     not_inv_sum, not_inv_det = build_not_invoiced_section(do_f)
     not_sent_sum, not_sent_det = build_not_sent_section(do_f)
     deferral_df, fact_deferral_series = build_deferral_analytics(dz_f, do_f)
+
+    # KPI «Не выставлено» = ровно сумма вкладки «Невыставленные счета»
+    inv_total = None
+    if not_inv_det is not None and not not_inv_det.empty and "Ставка заказчика" in not_inv_det.columns:
+        inv_total = float(pd.to_numeric(not_inv_det["Ставка заказчика"], errors="coerce").fillna(0).sum())
+    elif not_inv_sum is not None and not not_inv_sum.empty and "Итого" in not_inv_sum.columns:
+        _tmp = not_inv_sum.copy()
+        if "Клиент" in _tmp.columns:
+            _tmp = _tmp[_tmp["Клиент"].astype(str) != "ИТОГО"]
+        inv_total = float(pd.to_numeric(_tmp["Итого"], errors="coerce").fillna(0).sum())
+    if inv_total is not None:
+        metrics["Не выставлено"] = inv_total
+        metrics["Оборот"] = float(metrics.get("Выставлено", 0)) + inv_total
+        metrics["Неоплачено"] = float(metrics["Оборот"]) - float(metrics.get("Оплачено", 0))
+        metrics["Не отправлено"] = float(metrics.get("Нет в ПДЗ", 0)) + inv_total
 
 st.sidebar.caption(
     f"Строк ДЗ: {len(dz_f):,} · заявок ДО: {len(unissued_f):,}".replace(",", " ")
