@@ -438,6 +438,58 @@ def _pivot_client_month(work: pd.DataFrame, value_col: str = "Ставка за�
     return pivot
 
 
+
+def _apply_section_month_rules(work: pd.DataFrame) -> pd.DataFrame:
+    """
+    Правила для разделов Невыставленные / Неотправленные:
+    - ООО СКАЙ ТРЕЙД: апрель 2026 не учитываем;
+    - ТУЛЬСКАЯ ПТИЦЕФАБРИКА и ООО ОПХ: июнь–сентябрь 2026 → текущий месяц.
+    """
+    if work is None or work.empty:
+        return work
+    work = work.copy()
+    if "Клиент" not in work.columns:
+        return work
+    if "Дата выгрузки" in work.columns:
+        work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce", dayfirst=True)
+    else:
+        work["Дата выгрузки"] = pd.NaT
+    work["Месяц"] = work["Дата выгрузки"].map(_month_label)
+
+    name = work["Клиент"].astype(str).str.lower().str.replace("«", '"').str.replace("»", '"').str.replace("ё", "е")
+
+    # 1) СКАЙ ТРЕЙД — апрель 2026 исключить
+    is_sky = name.str.contains("скай", na=False) & name.str.contains("трейд", na=False)
+    unload = work["Дата выгрузки"]
+    is_apr_2026 = (unload.dt.year == 2026) & (unload.dt.month == 4) | (work["Месяц"] == "2026-04")
+    work = work.loc[~(is_sky & is_apr_2026)].copy()
+
+    if work.empty:
+        return work
+
+    name = work["Клиент"].astype(str).str.lower().str.replace("«", '"').str.replace("»", '"').str.replace("ё", "е")
+    unload = work["Дата выгрузки"]
+
+    # 2) ТУЛЬСКАЯ ПТИЦЕФАБРИКА и ОПХ — июнь–сен 2026 → текущий месяц
+    is_tula = name.str.contains("тульск", na=False) & name.str.contains("птицефабр", na=False)
+    is_oph = name.str.contains("опх", na=False)
+    is_move = is_tula | is_oph
+    is_jun_sep = (
+        ((unload.dt.year == 2026) & (unload.dt.month >= 6) & (unload.dt.month <= 9))
+        | work["Месяц"].isin(["2026-06", "2026-07", "2026-08", "2026-09"])
+    )
+    shift = is_move & is_jun_sep
+    if shift.any():
+        now = pd.Timestamp.now().normalize()
+        # первое число текущего месяца
+        cur_start = pd.Timestamp(year=now.year, month=now.month, day=1)
+        cur_label = f"{now.year}-{now.month:02d}"
+        work.loc[shift, "Дата выгрузки"] = cur_start
+        work.loc[shift, "Месяц"] = cur_label
+
+    return work
+
+
 def build_not_invoiced_section(do_full: pd.DataFrame):
     """Невыставленные: ставка > 2, нет счёта, нет оплаты клиента, не ИП/Взлет."""
     if do_full is None or do_full.empty:
@@ -472,6 +524,7 @@ def build_not_invoiced_section(do_full: pd.DataFrame):
     work.loc[shift, "Месяц"] = "2026-11"
 
     work = _drop_jan_sep_2026_excluded(work)
+    work = _apply_section_month_rules(work)
     if work.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -514,6 +567,7 @@ def build_not_sent_section(do_full: pd.DataFrame):
     work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce", dayfirst=True)
     work["Месяц"] = work["Дата выгрузки"].map(_month_label)
     work = _drop_jan_sep_2026_excluded(work)
+    work = _apply_section_month_rules(work)
     if work.empty:
         return pd.DataFrame(), pd.DataFrame()
 
