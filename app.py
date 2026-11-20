@@ -12,7 +12,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Финансовый дашборд ДЗ / ДО", page_icon="📊", layout="wide")
-APP_VERSION = "2026-11-20-v4"
+APP_VERSION = "2026-11-20-v5"
 
 
 
@@ -515,55 +515,132 @@ def _apply_section_month_rules(work: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
-def build_not_invoiced_section(do_full: pd.DataFrame):
-    """Невыставленные: ставка > 2, нет счёта, нет оплаты клиента, не ИП/Взлет."""
+
+def _is_unissued_period_exclude_client(name: str) -> bool:
+    """Янв–сен 2026 не учитываем для этих клиентов."""
+    s = str(name or "").lower().replace("«", '"').replace("»", '"').replace("ё", "е")
+    if re.search(r"(^|[\s\"'])ип([\s\"'.]|$)", s):
+        return True
+    if "взлет" in s:
+        return True
+    if "рикос" in s:
+        return True
+    if "элита" in s and "центр" in s:
+        return True
+    if "себ" in s and "восток" in s:
+        return True
+    if "интернет" in s and "решен" in s:
+        return True
+    if "открытие" in s and ("фк" in s or "банк" in s):
+        return True
+    return False
+
+
+def _is_unissued_shift_to_nov_client(name: str) -> bool:
+    """Июнь–сен 2026 → ноябрь 2026."""
+    s = str(name or "").lower().replace("«", '"').replace("»", '"').replace("ё", "е")
+    if "опх" in s:
+        return True
+    if "тульск" in s and "птицефабр" in s:
+        return True
+    if "газпромнефть" in s and "снабжен" in s:
+        return True
+    if "транснефть" in s and "логистик" in s:
+        return True
+    if "яндекс" in s and "маркет" in s:
+        return True
+    return False
+
+
+def filter_unissued_rows(do_full: pd.DataFrame) -> pd.DataFrame:
+    """
+    Единые правила для KPI «Не выставлено» и вкладки «Невыставленные счета»:
+    - нет счёта, нет даты оплаты клиента, нет даты оплаты по договору;
+    - ставка заказчика > 10;
+    - янв–сен 2026: не учитывать РИКОС, Элита-Центр, ВЗЛЕТ, СЕБ-ВОСТОК,
+      Интернет Решения, ФК Открытие, ИП;
+    - июнь–сен 2026 → ноябрь 2026: ОПХ, Тульская птицефабрика,
+      Газпромнефть-Снабжение, Транснефть-логистика, Яндекс Маркет.
+    """
     if do_full is None or do_full.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    mask = (
-        (do_full["Ставка заказчика"] >= MIN_RATE)
-        & do_full["_no_invoice"]
-        & do_full["Дата оплаты клиента"].isna()
-        & ~do_full["_excluded"]
-    )
-    work = do_full.loc[mask].copy()
+        return pd.DataFrame()
+
+    df = do_full.copy()
+    # колонки
+    if "Ставка заказчика" not in df.columns and "Сумма" in df.columns:
+        df["Ставка заказчика"] = df["Сумма"]
+    df["Ставка заказчика"] = pd.to_numeric(df["Ставка заказчика"], errors="coerce").fillna(0)
+
+    if "_no_invoice" in df.columns:
+        no_invoice = df["_no_invoice"]
+    else:
+        inv = df.get("Номер счета", pd.Series([""] * len(df))).astype(str).str.strip()
+        no_invoice = inv.isna() | (inv == "") | (inv.str.lower().isin(["nan", "none"])) | (inv == "0")
+
+    for c in ("Дата оплаты клиента", "Дата оплаты по договору", "Дата выгрузки"):
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+        else:
+            df[c] = pd.NaT
+
+    no_client_pay = df["Дата оплаты клиента"].isna()
+    no_pdo = df["Дата оплаты по договору"].isna()
+    rate_ok = df["Ставка заказчика"] > 10  # строго больше 10
+
+    client_col = "Клиент" if "Клиент" in df.columns else ("Контрагент" if "Контрагент" in df.columns else None)
+    if client_col is None:
+        return pd.DataFrame()
+    if client_col != "Клиент":
+        df["Клиент"] = df[client_col]
+
+    excluded = df["Клиент"].map(exclude_client_from_unissued)  # ИП/Взлет всегда
+    # также периодные исключения ниже
+
+    mask = no_invoice & no_client_pay & no_pdo & rate_ok & ~excluded
+    work = df.loc[mask].copy()
     if work.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return work
 
-    work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce")
-    work["Месяц"] = work["Дата выгрузки"].map(_month_label)
-
-    # Перенос авг–окт → 01.11.2026 для спец. клиентов (ОПХ и др.)
-    special_keys = (
-        "опх", "газпромнефть-снабжение", "газпромнефть снабжение",
-        "фактор", "транснефть-логистика", "транснефть логистика",
-    )
-
-    def _is_special(name: str) -> bool:
-        s = str(name or "").lower().replace("«", '"').replace("»", '"')
-        return any(k in s for k in special_keys)
-
-    is_spec = work["Клиент"].map(_is_special)
     unload = work["Дата выгрузки"]
-    shift = is_spec & unload.dt.month.isin([8, 9, 10]) & unload.notna()
-    work.loc[shift, "Дата выгрузки"] = pd.Timestamp("2026-11-01")
-    work.loc[shift, "Месяц"] = "2026-11"
-
-    work = _drop_jan_sep_2026_excluded(work)
-    work = _apply_section_month_rules(work)
+    # янв–сен 2026 drop
+    is_period_excl = work["Клиент"].map(_is_unissued_period_exclude_client)
+    in_jan_sep = (unload.dt.year == 2026) & (unload.dt.month >= 1) & (unload.dt.month <= 9)
+    work = work.loc[~(is_period_excl & in_jan_sep)].copy()
     if work.empty:
+        return work
+
+    unload = work["Дата выгрузки"]
+    # июнь–сен 2026 → 01.11.2026
+    is_shift = work["Клиент"].map(_is_unissued_shift_to_nov_client)
+    in_jun_sep = (unload.dt.year == 2026) & (unload.dt.month >= 6) & (unload.dt.month <= 9)
+    shift = is_shift & in_jun_sep
+    work.loc[shift, "Дата выгрузки"] = pd.Timestamp("2026-11-01")
+    work["Месяц"] = work["Дата выгрузки"].map(_month_label)
+    return work
+
+
+def build_not_invoiced_section(do_full: pd.DataFrame):
+    """Невыставленные — через filter_unissued_rows (единые правила с KPI)."""
+    work = filter_unissued_rows(do_full)
+    if work is None or work.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    detail = work[[
+    detail_cols = [
         "Заявка", "Клиент", "Дата загрузки", "Дата выгрузки",
         "Номер счета", "Ставка заказчика", "Ответственный сотрудник ДО", "Месяц",
-    ]].copy()
+    ]
+    for c in detail_cols:
+        if c not in work.columns:
+            work[c] = pd.NA if c != "Ставка заказчика" else 0.0
+    detail = work[detail_cols].copy()
     detail = detail.rename(columns={
         "Заявка": "Номер заявки",
         "Клиент": "Заказчик/клиент",
         "Дата загрузки": "Дата погрузки/загрузки",
     })
-    pivot = _pivot_client_month(work)
+    pivot = _pivot_client_month(work, value_col="Ставка заказчика")
     return pivot, detail
+
 
 
 def build_not_sent_section(do_full: pd.DataFrame):
