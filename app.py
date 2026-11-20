@@ -1322,8 +1322,17 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
                 title="Суммы: выставлено / оплачено / просрочено",
                 labels={"value": "Сумма, ₽", "variable": "Показатель"},
             )
-            # шаг оси Y — 10 млн ₽
-            fig.update_yaxes(dtick=10_000_000, tickformat=",.0f")
+            # Подписи оси Y: 50 млн, 100 млн, 150 млн… (без лишних делений)
+            y_max = float(
+                monthly_sum[["Выставлено", "Оплачено", "Просрочено"]].max().max() or 0
+            )
+            step = 50_000_000
+            ticks = list(range(0, int(y_max) + step, step)) or [0]
+            fig.update_yaxes(
+                tickvals=ticks,
+                ticktext=[f"{int(t / 1_000_000)} млн" for t in ticks],
+                range=[0, max(y_max * 1.05, step)],
+            )
             st.plotly_chart(fig, width="stretch")
 
         else:
