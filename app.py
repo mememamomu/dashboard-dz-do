@@ -1322,6 +1322,16 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
                 title="Суммы: выставлено / оплачено / просрочено",
                 labels={"value": "Сумма, ₽", "variable": "Показатель"},
             )
+            # Полные суммы при наведении: 2 111 799,00
+            fig.update_traces(
+                hovertemplate=(
+                    "%{fullData.name}<br>"
+                    "Месяц: %{x|%Y-%m}<br>"
+                    "Сумма: %{y:,.2f} ₽"
+                    "<extra></extra>"
+                )
+            )
+            fig.update_layout(separators=", ")  # пробел — тысячи, запятая — дробная часть
             # Подписи оси Y: 50 млн, 100 млн, 150 млн… (без лишних делений)
             y_max = float(
                 monthly_sum[["Выставлено", "Оплачено", "Просрочено"]].max().max() or 0
