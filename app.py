@@ -172,7 +172,7 @@ def exclude_client_from_unissued(name: str) -> bool:
 
 
 def is_special_unissued_exclude_client(name: str) -> bool:
-    """СД РИКОС, Элита-Центр, ГРУППА СЕБ-ВОСТОК, ВЗЛЕТ, ИП — для янв–сен 2026 без счетов."""
+    """Клиенты, чьи заявки без счетов за янв–сен 2026 не учитываем."""
     s = str(name or "").lower().replace("«", '"').replace("»", '"').replace("ё", "е")
     if re.search(r"(^|[\s\"'])ип([\s\"'.]|$)", s):
         return True
@@ -184,7 +184,15 @@ def is_special_unissued_exclude_client(name: str) -> bool:
         return True
     if "себ" in s and "восток" in s:
         return True
+    if "интернет" in s and "решен" in s:
+        return True
+    if "роксор" in s:
+        return True
+    if "открытие" in s and ("фк" in s or "банк" in s):
+        return True
     return False
+
+
 
 
 MIN_RATE = 10.0  # заявки со ставкой заказчика < 10 не учитываем
@@ -301,7 +309,7 @@ def ensure_unissued_categories(df: pd.DataFrame) -> pd.DataFrame:
     elif "Дата загрузки" in df.columns:
         unload = pd.to_datetime(df["Дата загрузки"], errors="coerce", dayfirst=True)
     if unload is not None:
-        is_excl = df[client_col].map(_is_jan_sep_2026_exclude_client)
+        is_excl = df[client_col].map(is_special_unissued_exclude_client)
         in_jan_sep = (unload.dt.year == 2026) & (unload.dt.month >= 1) & (unload.dt.month <= 9)
         period_drop = is_excl & in_jan_sep
         # СКАЙ ТРЕЙД — апрель 2026
