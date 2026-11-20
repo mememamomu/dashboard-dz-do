@@ -12,6 +12,8 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Финансовый дашборд ДЗ / ДО", page_icon="📊", layout="wide")
+APP_VERSION = "2026-11-20-v3"
+
 
 
 def get_secret(key, default=None):
@@ -305,9 +307,9 @@ def ensure_unissued_categories(df: pd.DataFrame) -> pd.DataFrame:
     period_drop = pd.Series(False, index=df.index)
     unload = None
     if "Дата выгрузки" in df.columns:
-        unload = pd.to_datetime(df["Дата выгрузки"], errors="coerce", dayfirst=True)
+        unload = pd.to_datetime(df["Дата выгрузки"], errors="coerce")
     elif "Дата загрузки" in df.columns:
-        unload = pd.to_datetime(df["Дата загрузки"], errors="coerce", dayfirst=True)
+        unload = pd.to_datetime(df["Дата загрузки"], errors="coerce")
     if unload is not None:
         is_excl = df[client_col].map(is_special_unissued_exclude_client)
         in_jan_sep = (unload.dt.year == 2026) & (unload.dt.month >= 1) & (unload.dt.month <= 9)
@@ -409,7 +411,7 @@ def _drop_jan_sep_2026_excluded(work: pd.DataFrame) -> pd.DataFrame:
         return work
     work = work.copy()
     if "Дата выгрузки" in work.columns:
-        work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce", dayfirst=True)
+        work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce")
     if "Месяц" not in work.columns or work["Месяц"].isna().all():
         if "Дата выгрузки" in work.columns:
             work["Месяц"] = work["Дата выгрузки"].map(_month_label)
@@ -474,7 +476,7 @@ def _apply_section_month_rules(work: pd.DataFrame) -> pd.DataFrame:
     if "Клиент" not in work.columns:
         return work
     if "Дата выгрузки" in work.columns:
-        work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce", dayfirst=True)
+        work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce")
     else:
         work["Дата выгрузки"] = pd.NaT
     work["Месяц"] = work["Дата выгрузки"].map(_month_label)
@@ -484,7 +486,7 @@ def _apply_section_month_rules(work: pd.DataFrame) -> pd.DataFrame:
     # 1) СКАЙ ТРЕЙД — апрель 2026 исключить
     is_sky = name.str.contains("скай", na=False) & name.str.contains("трейд", na=False)
     unload = work["Дата выгрузки"]
-    is_apr_2026 = (unload.dt.year == 2026) & (unload.dt.month == 4) | (work["Месяц"] == "2026-04")
+    is_apr_2026 = ((unload.dt.year == 2026) & (unload.dt.month == 4)) | (work["Месяц"] == "2026-04")
     work = work.loc[~(is_sky & is_apr_2026)].copy()
 
     if work.empty:
@@ -527,7 +529,7 @@ def build_not_invoiced_section(do_full: pd.DataFrame):
     if work.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce", dayfirst=True)
+    work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce")
     work["Месяц"] = work["Дата выгрузки"].map(_month_label)
 
     # Перенос авг–окт → 01.11.2026 для спец. клиентов (ОПХ и др.)
@@ -587,7 +589,7 @@ def build_not_sent_section(do_full: pd.DataFrame):
     if work.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce", dayfirst=True)
+    work["Дата выгрузки"] = pd.to_datetime(work["Дата выгрузки"], errors="coerce")
     work["Месяц"] = work["Дата выгрузки"].map(_month_label)
     work = _drop_jan_sep_2026_excluded(work)
     work = _apply_section_month_rules(work)
@@ -808,7 +810,7 @@ def find_col(df, *candidates):
 
 
 def to_date(series):
-    return pd.to_datetime(series, errors="coerce", dayfirst=True)
+    return pd.to_datetime(series, errors="coerce")
 
 
 def extract_invoice_date(value):
@@ -817,7 +819,7 @@ def extract_invoice_date(value):
     match = re.search(r"\bот\s+(\d{2}\.\d{2}\.\d{4})", str(value), flags=re.I)
     if not match:
         match = re.search(r"(\d{2}\.\d{2}\.\d{4})", str(value))
-    return pd.to_datetime(match.group(1), dayfirst=True, errors="coerce") if match else pd.NaT
+    return pd.to_datetime(match.group(1), errors="coerce") if match else pd.NaT
 
 
 def number(series):
@@ -1465,6 +1467,7 @@ def render_dashboard(summary_f, metrics, plan_df, dz_f, unissued_f, not_inv_sum,
 
 # =============================================================================
 st.title("📊 Финансовый дашборд ДЗ / ДО")
+st.caption(f"Версия приложения: {APP_VERSION}")
 
 with st.sidebar:
     st.header("Режим")
